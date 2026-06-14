@@ -41,7 +41,41 @@ type Report struct {
 	OK bool
 }
 
-// Reconcile 计算对账结论。
+// Validate 校验对账输入的自洽性（阶段 6 (f)：DLQ accounting 加固）。
+//
+// 目的：DLQ 必须被**显式且正确**地计入账目，否则会把「合法路由进 DLQ 的消息」误判成 ES 缺失，
+// 或反过来用一个虚高的 DLQ 把真实漏灌掩盖成 false OK（diff=0）。这里把不自洽的计数挡在对平之前
+// （fail-closed：宁可报错也不在可疑输入上判 OK）：
+//   - 任何计数为负 → 采集错误，拒绝。
+//   - DLQ > SourceRows → DLQ 计数不可能超过源行数；多半传错（虚高 DLQ 会缩小 Expected 掩盖漏灌）。
+//   - RawExcluded > ESDocs → raw_excluded 是 ES doc 的子集（content=null 仍占 doc），不可能超过 ESDocs。
+//   - Expected(=SourceRows-DLQ) < 0 → 口径崩坏，拒绝。
+func (c Counts) Validate() error {
+	if c.SourceRows < 0 || c.ESDocs < 0 || c.RawExcluded < 0 || c.DLQ < 0 {
+		return fmt.Errorf("recon: negative count in %+v (collection error)", c)
+	}
+	if c.DLQ > c.SourceRows {
+		return fmt.Errorf("recon: DLQ(%d) > source_rows(%d): impossible — a too-high DLQ would shrink Expected and mask a shortfall as false OK", c.DLQ, c.SourceRows)
+	}
+	if c.RawExcluded > c.ESDocs {
+		return fmt.Errorf("recon: raw_excluded(%d) > es_docs(%d): raw_excluded docs are a subset of ES docs (content=null still occupies a doc)", c.RawExcluded, c.ESDocs)
+	}
+	if c.SourceRows-c.DLQ < 0 {
+		return fmt.Errorf("recon: expected es docs = source_rows(%d) - DLQ(%d) < 0", c.SourceRows, c.DLQ)
+	}
+	return nil
+}
+
+// ReconcileChecked 校验输入自洽性后再对账（阶段 6 backfill 正确性门的入口）。
+// 输入不自洽 → 返回错误（绝不在可疑计数上给出 OK/MISMATCH 结论）。
+func ReconcileChecked(c Counts) (Report, error) {
+	if err := c.Validate(); err != nil {
+		return Report{}, err
+	}
+	return Reconcile(c), nil
+}
+
+// Reconcile 计算对账结论（纯算术，不校验自洽性；门入口请用 ReconcileChecked）。
 //
 // 口径推导（raw_excluded 仍是一条 ES doc）：
 //

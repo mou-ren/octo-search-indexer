@@ -92,3 +92,53 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// ── DLQ accounting 加固（阶段 6 (f)）─────────────────────────────────────────────
+
+// TestReconcileChecked_OK 自洽输入 → 校验通过并对平。
+func TestReconcileChecked_OK(t *testing.T) {
+	r, err := ReconcileChecked(Counts{SourceRows: 1000, ESDocs: 997, RawExcluded: 50, DLQ: 3})
+	if err != nil {
+		t.Fatalf("self-consistent input must pass: %v", err)
+	}
+	if !r.OK || r.Expected != 997 {
+		t.Fatalf("want OK expected=997, got %+v", r)
+	}
+}
+
+// TestReconcileChecked_DLQExceedsSource DLQ>源行数 → 拒绝（虚高 DLQ 会缩小 Expected 掩盖漏灌）。
+func TestReconcileChecked_DLQExceedsSource(t *testing.T) {
+	// 若不拦截：Expected=100-150=-50，ES=0 → diff=50≠0... 但更隐蔽的是用虚高 DLQ 把真实
+	// 缺口算平。这里直接在自洽性层拦下。
+	if _, err := ReconcileChecked(Counts{SourceRows: 100, ESDocs: 0, DLQ: 150}); err == nil {
+		t.Fatalf("DLQ > source_rows must be rejected")
+	}
+}
+
+// TestReconcileChecked_DLQMasksShortfall 虚高 DLQ 把真实漏灌算成 false OK → 必须被自洽性拦下。
+func TestReconcileChecked_DLQMasksShortfall(t *testing.T) {
+	// 源 1000，实际只灌了 900（漏 100），但谎报 DLQ=100 → Expected=900 == ES 900 → 朴素 Reconcile 会判 OK！
+	naive := Reconcile(Counts{SourceRows: 1000, ESDocs: 900, DLQ: 100})
+	if !naive.OK {
+		t.Fatalf("precondition: naive reconcile would falsely pass; got %+v", naive)
+	}
+	// DLQ=100 <= source=1000，raw_excluded=0<=ES，这个例子自洽性是过的——说明自洽性层不是万能。
+	// 真正防线是 DLQ 由 backfill 自己精确计数（不靠人工传），自洽性只挡明显不可能的输入。
+	if _, err := ReconcileChecked(Counts{SourceRows: 1000, ESDocs: 900, DLQ: 100}); err != nil {
+		t.Fatalf("this input IS self-consistent (defense is authoritative DLQ count, not validation): %v", err)
+	}
+}
+
+// TestReconcileChecked_RawExcludedExceedsES raw_excluded>ES doc → 拒绝（raw_excluded 是 ES doc 子集）。
+func TestReconcileChecked_RawExcludedExceedsES(t *testing.T) {
+	if _, err := ReconcileChecked(Counts{SourceRows: 100, ESDocs: 50, RawExcluded: 60}); err == nil {
+		t.Fatalf("raw_excluded > es_docs must be rejected")
+	}
+}
+
+// TestReconcileChecked_Negative 负计数（采集错误）→ 拒绝。
+func TestReconcileChecked_Negative(t *testing.T) {
+	if _, err := ReconcileChecked(Counts{SourceRows: -1, ESDocs: 0}); err == nil {
+		t.Fatalf("negative count must be rejected")
+	}
+}

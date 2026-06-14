@@ -81,3 +81,37 @@ a real broker + real OpenSearch.
   production the platform provisions them.
 - The harness OpenSearch disables the security plugin for plain-HTTP local
   testing only — production uses authenticated endpoints (`ES_USERNAME`/`ES_PASSWORD`).
+
+## Phase-6 backfill harness (`run-backfill.sh` + `backfill/`)
+
+A second, self-contained e2e that exercises the historical backfill job (`cmd/backfill`)
+against a real MySQL + OpenSearch(IK), bypassing Kafka:
+
+```
+MySQL message shards → cmd/backfill (keyset scan → internal/esindex.Writer bulk) → OpenSearch
+```
+
+| Path | What |
+| --- | --- |
+| `run-backfill.sh` | orchestrator: `up` (throwaway OpenSearch(IK) + MySQL) / `seed` / `backfill` / `verify` / `down` / `all` |
+| `backfill/` | seeds a controlled 6-row suite into the `message` shard tables and verifies the ES result |
+
+The seeded suite is deliberately tiny and explicit so the gate arithmetic is obvious:
+3 text rows (incl. 中文) + 1 Signal-encrypted + 1 non-text (image) + 1 bad-JSON anomaly.
+So `source_rows=6`, expected `ES docs=5` (`6 - 1 DLQ`), `raw_excluded=2`.
+
+```sh
+./harness/run-backfill.sh          # up → seed MySQL → backfill+reconcile gate → verify → down
+KEEP_UP=1 ./harness/run-backfill.sh
+```
+
+What it proves (mirrors the unit tests against real infra):
+- reuses `internal/esindex` writer + IK mapping (`ik_max_word`/`ik_smart`), `_id=message_id`;
+- `raw_excluded` rows (Signal/non-text) still occupy an ES doc; the bad-JSON anomaly is
+  routed to the local DLQ spill and is **positively asserted absent** from ES;
+- the reconcile gate runs inline and is `OK | source_rows=6 es_docs=5 expected=5 diff=0`
+  (it force-refreshes the index first so a refresh lag can't cause a false MISMATCH);
+- re-running is a no-op via the checkpoint and idempotent (`_id` upsert) — ES count stays 5;
+- IK 中文 recall works on backfilled docs (`公园` → the 公园 row, `北京` → the 北京 row).
+
+See `docs/backfill.md` for the production runbook and isolation discipline.

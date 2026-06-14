@@ -9,6 +9,11 @@ todos
 # Test binary
 *.test
 
+# Ad-hoc local build artifacts (e.g. `go build -o backfill ./cmd/backfill`)
+/backfill
+/es-indexer
+/reconcile
+
 # Output
 *.out
 
