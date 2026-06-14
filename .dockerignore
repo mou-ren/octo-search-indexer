@@ -1,0 +1,26 @@
+# Internal design docs — not needed in build context
+*.md
+docs/
+
+# VCS metadata
+.git
+.gitignore
+.github
+
+# Local dev
+docker-compose*.yaml
+.env
+.env.*
+!.env.example
+
+# Conductor workspace state
+.context
+
+# Editor / IDE
+.idea
+.vscode
+*.swp
+
+# Test artifacts
+coverage.out
+*.test
