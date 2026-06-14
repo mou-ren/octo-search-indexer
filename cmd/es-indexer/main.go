@@ -13,10 +13,10 @@
 //     以便阶段 6 backfill job 复用同一写入器。
 //   - schema_version 校验：收到未知契约版本进 DLQ，不静默吃。
 //   - offset 仅推进到「连续成功前缀」；transient(429/5xx) 退避重试，permanent(4xx)
-//     进 DLQ（C4）。
+//     进 DLQ；DLQ 写自身 transient 失败有终态逃逸（C4）。
 //
-// 本文件目前是阶段 4 施工前的入口骨架（stub），仅建立 binary 边界与优雅退出，
-// 保证 `go build ./...` 通过。真实 Kafka consumer + bulk 落在阶段 4。
+// 配置全部走环境变量（一仓一镜像、独立部署）。未配置 Kafka brokers / ES 地址时，服务
+// 不连任何后端、空转到收到终止信号——保持「未开通即零运行期行为」，须显式注入配置才工作。
 package main
 
 import (
@@ -24,26 +24,103 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-search-indexer/internal/consumer"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	log.Printf("es-indexer starting (scaffold; phase 4 implements Kafka consumer + ES bulk writer)")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx); err != nil {
+	if err := run(ctx); err != nil && ctx.Err() == nil {
 		log.Printf("es-indexer exited with error: %v", err)
 		os.Exit(1)
 	}
 	log.Printf("es-indexer stopped")
 }
 
-// run 是服务主循环挂点。骨架阶段仅阻塞到收到终止信号后干净退出；阶段 4 在此
-// 启动 Kafka consumer、构造 esindex.Writer、起 /metrics 抓取端点。
+// run 装配并运行索引器服务。未配置后端时空转到信号（零运行期行为）。
 func run(ctx context.Context) error {
-	<-ctx.Done()
-	return nil
+	cfg, enabled := loadConfig()
+	if !enabled {
+		log.Printf("es-indexer: ES_INDEXER_ENABLED not true (or brokers/ES unset); idling (no backend connection)")
+		<-ctx.Done()
+		return nil
+	}
+
+	svc, err := consumer.NewService(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := svc.Close(); cerr != nil {
+			log.Printf("es-indexer: close error: %v", cerr)
+		}
+	}()
+
+	log.Printf("es-indexer running: topic=%s group=%s es_index=%s", cfg.Topic, cfg.GroupID, cfg.ESIndex)
+	return svc.Run(ctx)
+}
+
+// loadConfig 从环境读取配置。返回 enabled=false 时服务空转（未开通）。
+// 开通条件：ES_INDEXER_ENABLED=true 且 brokers / ES 地址均已配置。
+func loadConfig() (consumer.ServiceConfig, bool) {
+	cfg := consumer.ServiceConfig{
+		Brokers:          splitCSV(os.Getenv("KAFKA_BROKERS")),
+		Topic:            envOr("KAFKA_TOPIC", "octo.message.v1"),
+		DLQTopic:         envOr("KAFKA_DLQ_TOPIC", "octo.message.v1.dlq"),
+		GroupID:          envOr("KAFKA_GROUP_ID", "octo-search-indexer"),
+		BatchSize:        envInt("INDEXER_BATCH_SIZE", 500),
+		ESAddresses:      splitCSV(os.Getenv("ES_ADDRESSES")),
+		ESIndex:          envOr("ES_INDEX", "octo-message"),
+		ESUsername:       os.Getenv("ES_USERNAME"),
+		ESPassword:       os.Getenv("ES_PASSWORD"),
+		TransientBackoff: time.Duration(envInt("INDEXER_TRANSIENT_BACKOFF_MS", 1000)) * time.Millisecond,
+		DLQMaxRetries:    envInt("INDEXER_DLQ_MAX_RETRIES", 5),
+		DLQRetryBackoff:  time.Duration(envInt("INDEXER_DLQ_RETRY_BACKOFF_MS", 200)) * time.Millisecond,
+		DLQSpillDir:      os.Getenv("INDEXER_DLQ_SPILL_DIR"),
+	}
+	enabled := strings.EqualFold(os.Getenv("ES_INDEXER_ENABLED"), "true") &&
+		len(cfg.Brokers) > 0 && len(cfg.ESAddresses) > 0
+	return cfg, enabled
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("es-indexer: invalid %s=%q, using default %d", key, v, def)
+		return def
+	}
+	return n
+}
+
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }

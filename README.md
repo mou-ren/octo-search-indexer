@@ -44,12 +44,50 @@ independent binary/image distinct from `octo-server`.
 
 | Path                  | Purpose                                                        |
 | --------------------- | ------------------------------------------------------------- |
-| `cmd/es-indexer/`     | Service entrypoint: Kafka consumer, offset/DLQ routing, /metrics |
-| `internal/esindex/`   | Reusable ES bulk writer (imported by both the service and the phase-6 backfill job) |
+| `cmd/es-indexer/`     | Service entrypoint: env config, graceful shutdown             |
+| `internal/consumer/`  | Kafka consumer: FetchMessage + manual commit, ordered-prefix offset, DLQ routing + terminal escape (C4) |
+| `internal/esindex/`   | Reusable ES bulk writer + index mapping bootstrap (imported by both the service and the phase-6 backfill job) |
+| `internal/esindex/mapping/` | Canonical `octo-message` index mapping + 中文 analyzer (single source for the octo-deployment change) |
 
-> Current state: scaffold (package boundaries + signatures established,
-> `go build ./...` / `go vet ./...` / `go test ./...` pass). The Kafka consumer
-> and real OpenSearch bulk writer land in phase 4.
+## Reliability semantics (C4)
+
+- **Manual commit only.** The Reader uses `FetchMessage` + `CommitInterval=0`
+  (no `ReadMessage` auto-commit). Offset advances **only to the contiguous
+  success prefix** — the first transient failure stops the prefix, so Kafka's
+  monotonic high-watermark commit can never silently confirm an unprocessed
+  message.
+- **Transient vs permanent.** 429 / 5xx / network / batch-level failures are
+  transient → in-place backoff retry, offset not advanced. 4xx (except 429) and
+  unknown `schema_version` are permanent poison pills → routed to the DLQ topic,
+  then the offset crosses them.
+- **DLQ terminal escape.** If the DLQ write itself keeps failing (transient),
+  a bounded retry is followed by either local spill-to-disk + alarm + advance
+  (when `INDEXER_DLQ_SPILL_DIR` is set), or a hard stop + page (when it is not).
+  A DLQ outage can never wedge the prefix forever.
+- **Idempotent sink.** `_id = message_id` → duplicate delivery upserts the same
+  doc (effectively-once on top of at-least-once).
+
+## Configuration (env)
+
+| Variable | Default | Notes |
+| -------- | ------- | ----- |
+| `ES_INDEXER_ENABLED` | `false` | must be `true` AND brokers+ES set, else the binary idles (zero runtime effect) |
+| `KAFKA_BROKERS` | — | CSV broker list |
+| `KAFKA_TOPIC` | `octo.message.v1` | body topic |
+| `KAFKA_DLQ_TOPIC` | `octo.message.v1.dlq` | poison-pill topic |
+| `KAFKA_GROUP_ID` | `octo-search-indexer` | consumer group |
+| `ES_ADDRESSES` | — | CSV OpenSearch node list |
+| `ES_INDEX` | `octo-message` | target index |
+| `ES_USERNAME` / `ES_PASSWORD` | — | HTTP basic auth |
+| `INDEXER_BATCH_SIZE` | `500` | max docs per bulk |
+| `INDEXER_TRANSIENT_BACKOFF_MS` | `1000` | retry backoff on transient |
+| `INDEXER_DLQ_MAX_RETRIES` | `5` | DLQ write retries before escape |
+| `INDEXER_DLQ_RETRY_BACKOFF_MS` | `200` | DLQ retry backoff base |
+| `INDEXER_DLQ_SPILL_DIR` | — | set to enable spill escape; empty → hard-stop escape |
+
+> Phase 4 delivered: Kafka consumer (C4), OpenSearch bulk writer, index mapping
+> + 中文 analyzer bootstrap. `/metrics` and lag/backlog instrumentation land in
+> phase 7.
 
 ## Build
 

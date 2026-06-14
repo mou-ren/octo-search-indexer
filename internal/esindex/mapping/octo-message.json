@@ -1,0 +1,36 @@
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 1,
+      "number_of_replicas": 1
+    },
+    "analysis": {
+      "analyzer": {
+        "octo_cjk_text": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "cjk_width", "cjk_bigram"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "schema_version": { "type": "integer" },
+      "message_id":     { "type": "keyword" },
+      "channel_id":     { "type": "keyword" },
+      "channel_type":   { "type": "integer" },
+      "from_uid":       { "type": "keyword" },
+      "content": {
+        "type": "text",
+        "analyzer": "octo_cjk_text"
+      },
+      "content_type":   { "type": "integer" },
+      "raw_excluded":   { "type": "boolean" },
+      "msg_timestamp":  { "type": "long" },
+      "created_at":     { "type": "long" },
+      "source":         { "type": "keyword" }
+    }
+  }
+}
