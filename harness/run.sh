@@ -51,10 +51,32 @@ up() {
 create_topics() {
   echo "[harness] pre-creating topics (body + DLQ)..."
   for t in octo.message.v1 octo.message.v1.dlq; do
-    docker exec octo-harness-kafka /opt/kafka/bin/kafka-topics.sh \
+    local out rc
+    # Capture rc safely under `set -e`: a bare `out="$(cmd)"` would exit the
+    # script on non-zero before we can inspect rc, so use an if-guard.
+    if out="$(docker exec octo-harness-kafka /opt/kafka/bin/kafka-topics.sh \
       --bootstrap-server localhost:9092 --create --if-not-exists \
-      --topic "$t" --partitions 1 --replication-factor 1 >/dev/null 2>&1 || true
+      --topic "$t" --partitions 1 --replication-factor 1 2>&1)"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    # --if-not-exists makes an existing topic a no-op; tolerate only that.
+    # Any other non-zero (broker down, auth, bad config) must fail loudly.
+    if [[ $rc -ne 0 ]] && ! grep -qiE "already exists" <<<"$out"; then
+      echo "[harness] FATAL: creating topic $t failed: $out" >&2
+      exit 1
+    fi
   done
+}
+
+# dlq_end_offset prints the current DLQ topic log-end offset (sum across
+# partitions). Used to fence the verifier so it only inspects DLQ records
+# produced by THIS run (guards against stale records on a kept-up stack).
+dlq_end_offset() {
+  docker exec octo-harness-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server localhost:9092 --topic octo.message.v1.dlq 2>/dev/null \
+    | awk -F: '{s+=$3} END{print s+0}'
 }
 
 down() {
@@ -88,13 +110,29 @@ stop_indexer() {
 }
 
 seed() {
+  # Fence the DLQ verification to records produced by THIS run: capture the DLQ
+  # log-end offset BEFORE seeding so the verifier ignores stale records from a
+  # prior kept-up/failed run.
+  DLQ_START_OFFSET="$(dlq_end_offset)"
+  export DLQ_START_OFFSET
+  echo "[harness] DLQ fence start offset = ${DLQ_START_OFFSET}"
   echo "[harness] seeding controlled message suite..."
   ( cd "$ROOT" && KAFKA_BROKERS="$KAFKA_EXTERNAL" go run ./harness/seed -mode suite )
 }
 
 verify() {
   echo "[harness] verifying invariants..."
-  ( cd "$ROOT" && ES_URL="$ES_URL" ES_INDEX="$ES_INDEX" go run ./harness/verify )
+  # If the fence wasn't captured (e.g. standalone `run.sh verify`), pass -1 so the
+  # verifier engages its fail-closed default (abort on a non-empty DLQ) rather than
+  # silently scanning from offset 0 and risking a stale-record false PASS.
+  ( cd "$ROOT" && \
+    ES_URL="$ES_URL" ES_INDEX="$ES_INDEX" \
+    KAFKA_BROKERS="$KAFKA_EXTERNAL" \
+    KAFKA_TOPIC=octo.message.v1 \
+    KAFKA_DLQ_TOPIC=octo.message.v1.dlq \
+    KAFKA_GROUP_ID=octo-search-indexer-harness \
+    DLQ_START_OFFSET="${DLQ_START_OFFSET:--1}" \
+    go run ./harness/verify )
 }
 
 case "${1:-all}" in

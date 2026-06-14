@@ -35,18 +35,36 @@ ES_INDEXER_ENABLED=true KAFKA_BROKERS=localhost:19092 \
   ES_ADDRESSES=http://localhost:19200 ES_INDEX=octo-message \
   KAFKA_DLQ_TOPIC=octo.message.v1.dlq INDEXER_DLQ_SPILL_DIR=/tmp/spill \
   go run ./cmd/es-indexer &        # start the indexer against the harness
+
+# Fence the DLQ check to THIS run: capture the DLQ end offset BEFORE seeding.
+FENCE=$(docker exec octo-harness-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 --topic octo.message.v1.dlq 2>/dev/null \
+  | awk -F: '{s+=$3} END{print s+0}')
 go run ./harness/seed -mode suite  # seed the controlled suite
-go run ./harness/verify            # assert invariants
+DLQ_START_OFFSET="$FENCE" go run ./harness/verify   # assert invariants
 ./harness/run.sh down
 ```
+
+> The verifier is **fail-closed** on the DLQ fence: if `DLQ_START_OFFSET` is not
+> provided and the DLQ topic already contains records, `verify` aborts rather than
+> risk matching stale poison-pill records from a previous run. On a fresh/empty DLQ
+> no fence is needed. `run.sh` captures and passes the fence automatically.
 
 Ports: Kafka `localhost:19092`, OpenSearch `http://localhost:19200`.
 
 ## Invariants asserted (`verify/`)
 
+- **Consumer-group drained (Kafka)** — the committed offset of the consumer group
+  reaches the body topic's log-end offset on every partition. This is the
+  authoritative drain proof (queried from Kafka directly, not inferred from ES doc
+  counts), so the negative "not indexed" assertions below are sound. It cannot be
+  fooled by a consumer that stalled before the poison pills or by the DLQ-spill path.
 - **Idempotency** — duplicate `message_id` → exactly one ES doc (`_id` upsert).
-- **C4 schema gate** — unknown `schema_version` and malformed JSON are NOT
-  indexed (routed to the DLQ topic).
+- **C4 schema gate — both directions:**
+  - positive: the **DLQ topic actually contains** the poison-pill keys
+    (`m-badschema`, `m-badjson`) — read straight from the DLQ topic, proving the
+    routing happened;
+  - negative: those messages are **NOT** in the ES body index.
 - **raw_excluded** — Signal/non-text doc IS indexed (content null), occupies a doc.
 - **IK tokenization** — Chinese terms (`公园`, `北京`) recall their docs; English
   (`pipeline`) too.

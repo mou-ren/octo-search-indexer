@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,16 +23,43 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	var (
-		esURL   = flag.String("es", envOr("ES_URL", "http://localhost:19200"), "OpenSearch base URL")
-		index   = flag.String("index", envOr("ES_INDEX", "octo-message"), "index name")
-		waitFor = flag.Duration("wait", 60*time.Second, "max wait for docs to appear")
+		esURL    = flag.String("es", envOr("ES_URL", "http://localhost:19200"), "OpenSearch base URL")
+		index    = flag.String("index", envOr("ES_INDEX", "octo-message"), "index name")
+		brokers  = flag.String("brokers", envOr("KAFKA_BROKERS", "localhost:19092"), "kafka brokers (csv)")
+		topic    = flag.String("topic", envOr("KAFKA_TOPIC", "octo.message.v1"), "body topic")
+		dlqTopic = flag.String("dlq", envOr("KAFKA_DLQ_TOPIC", "octo.message.v1.dlq"), "DLQ topic")
+		group    = flag.String("group", envOr("KAFKA_GROUP_ID", "octo-search-indexer-harness"), "consumer group id")
+		dlqStart = flag.Int64("dlq-start-offset", envInt64("DLQ_START_OFFSET", -1), "only consider DLQ records at/after this offset (fence stale records from prior runs); -1 = not provided")
+		waitFor  = flag.Duration("wait", 60*time.Second, "max wait for docs to appear")
 	)
 	flag.Parse()
 
-	ctx, cancel := context.WithTimeout(context.Background(), *waitFor+30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), *waitFor+120*time.Second)
 	defer cancel()
 
 	v := &verifier{es: strings.TrimRight(*esURL, "/"), index: *index, hc: &http.Client{Timeout: 10 * time.Second}}
+	kv := newKafkaVerifier(splitCSV(*brokers))
+
+	// 🔴 DLQ fence resolution (fail-closed). The dlq-contains-poison check must only
+	// inspect records from THIS run, otherwise stale poison-pill records from a prior
+	// kept-up/failed run could yield a false PASS. If no fence was provided
+	// (-dlq-start-offset / DLQ_START_OFFSET unset) we resolve it safely:
+	//   - DLQ currently EMPTY  → fence 0 (clean start; nothing stale to confuse us).
+	//   - DLQ currently NON-EMPTY → FAIL: refuse to run an ambiguous check. The caller
+	//     must capture the DLQ end offset BEFORE seeding and pass it (run.sh does this).
+	fence := *dlqStart
+	if fence < 0 {
+		existing, err := kv.topicEndOffset(ctx, *dlqTopic)
+		if err != nil {
+			log.Fatalf("dlq fence: cannot read DLQ %q end offset: %v", *dlqTopic, err)
+		}
+		if existing > 0 {
+			log.Fatalf("dlq fence: DLQ %q already has %d record(s) and no -dlq-start-offset given; "+
+				"capture the DLQ end offset BEFORE seeding and pass it (run.sh does this automatically). "+
+				"Refusing to run dlq-contains-poison against possibly-stale records.", *dlqTopic, existing)
+		}
+		fence = 0
+	}
 
 	// Refresh so seeded docs are searchable.
 	if err := v.refresh(ctx); err != nil {
@@ -48,8 +76,15 @@ func main() {
 		}
 	}
 
-	// Positives first: these poll until present, proving the consumer has made
-	// progress through the suite.
+	// 🔴 Authoritative drain proof via KAFKA (not ES doc-count): the consumer group's
+	// committed offset must reach the body topic's log-end on every partition. This
+	// proves the poison pills were actually consumed (and committed past), so the
+	// "not indexed" assertions below are sound — and it cannot be fooled by a
+	// consumer that stalled before the pills or by the DLQ-spill path.
+	drainErr := kv.expectGroupDrained(ctx, *topic, *group, 90*time.Second)
+	check("consumer-group-drained", drainErr)
+
+	// Positives: these poll until present, confirming healthy indexing.
 	// Invariant: idempotency — duplicate message_id => exactly one doc.
 	check("idempotent-dup", v.expectDocExists(ctx, "m-dup"))
 	check("idempotent-count", v.expectCount(ctx, term("message_id", "m-dup"), 1))
@@ -63,19 +98,15 @@ func main() {
 	// English still works.
 	check("en-recall-pipeline", v.expectMatchAtLeast(ctx, "content", "pipeline", 1))
 
-	// Before negative assertions, the consumer MUST be proven drained: wait for the
-	// index doc count to be unchanged for a quiet period. If drain can't be proven
-	// (count never settles / _count errors), the "not indexed" assertions are
-	// inconclusive — we record a FAILURE rather than continuing, so a poison pill
-	// that would be indexed slightly later can never yield a false PASS.
-	drainErr := v.waitDocCountStable(ctx, 8*time.Second, 40*time.Second)
-	check("consumer-drained", drainErr)
+	// 🔴 C4 schema gate — verify BOTH directions:
+	//  (1) positive: the DLQ topic actually CONTAINS the poison-pill keys (routing happened);
+	//  (2) negative: those messages are NOT in the ES body index.
+	// The negative assertions only stand once the group is proven drained.
+	check("dlq-contains-poison", kv.expectDLQKeys(ctx, *dlqTopic, []string{"m-badschema", "m-badjson"}, fence, 60*time.Second))
 	if drainErr == nil {
-		// Invariant: schema_version unknown + bad JSON => NOT in ES (routed to DLQ).
 		check("badschema-not-indexed", v.expectCount(ctx, term("message_id", "m-badschema"), 0))
 		check("badjson-not-indexed", v.expectCount(ctx, term("message_id", "m-badjson"), 0))
 	} else {
-		// Drain unproven → do not assert "not indexed" (would be inconclusive).
 		failures = append(failures, "badschema/badjson: skipped — consumer drain not proven")
 		log.Printf("FAIL badschema/badjson: skipped — consumer drain not proven (%v)", drainErr)
 	}
@@ -199,35 +230,6 @@ func (v *verifier) count(ctx context.Context, query map[string]any) (int, error)
 	return out.Count, nil
 }
 
-// waitDocCountStable polls the total index doc count until it is unchanged for
-// `quiet`, or `maxWait` elapses. Used to ensure the consumer has drained before
-// asserting that poison-pill docs are NOT indexed (avoids a too-early false PASS).
-func (v *verifier) waitDocCountStable(ctx context.Context, quiet, maxWait time.Duration) error {
-	deadline := time.Now().Add(maxWait)
-	matchAll := map[string]any{"match_all": map[string]any{}}
-	last := -1
-	stableSince := time.Now()
-	for {
-		if rerr := v.refresh(ctx); rerr != nil {
-			log.Printf("warn: refresh: %v", rerr)
-		}
-		n, err := v.count(ctx, matchAll)
-		if err != nil {
-			return err
-		}
-		if n != last {
-			last = n
-			stableSince = time.Now()
-		} else if time.Since(stableSince) >= quiet {
-			return nil // count held steady for the quiet period
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("doc count not stable within %s (last=%d)", maxWait, last)
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
 func term(field, val string) map[string]any {
 	return map[string]any{"term": map[string]any{field: val}}
 }
@@ -241,4 +243,24 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
