@@ -104,12 +104,16 @@ func run() error {
 		return err
 	}
 
-	report := recon.Reconcile(recon.Counts{
+	report, err := recon.ReconcileChecked(recon.Counts{
 		SourceRows:  sourceRows,
 		ESDocs:      esDocs,
 		RawExcluded: rawExcluded,
 		DLQ:         *dlq,
 	})
+	if err != nil {
+		// 输入不自洽（DLQ accounting 加固，阶段 6 (f)）：拒绝在可疑计数上判 OK。
+		return err
+	}
 	fmt.Println(report.String())
 	if !report.OK {
 		// 不对平：退出码 2，作为 backfill/CI gate 的失败信号。
