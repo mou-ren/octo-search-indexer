@@ -77,8 +77,8 @@ type srcMessageRow struct {
 //   - Signal 加密（setting 位 或 signal 列为真）→ raw_excluded（不尝试解析密文，避免误判 DLQ）。
 //   - 非 Signal → payload 应为明文 JSON；解析失败 / 空 map（本应可解析却失败的真异常）→ DLQ。
 //   - 解析成功后按 type（兼容 json 反序列化的 float64 / 内部 int / json.Number）：
-//       · type=Text 且 content 为 string → 取该 string 作正文（outcomeOK）。
-//       · 非 Text 或 content 非 string（媒体 / 富文本 / 结构化对象）→ 保守 raw_excluded。
+//     · type=Text 且 content 为 string → 取该 string 作正文（outcomeOK）。
+//     · 非 Text 或 content 非 string（媒体 / 富文本 / 结构化对象）→ 保守 raw_excluded。
 func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
 	msg := searchmsg.Message{
 		SchemaVersion: searchmsg.SchemaVersion,
