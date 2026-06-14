@@ -105,25 +105,26 @@ func loadSeen(path string) (map[string]int64, error) {
 		return seen, nil
 	}
 
-	// 逐条扫描（记录以 '\n' 分隔；最后一段可能无结尾换行）。解析失败时区分「是否最后一条」：
-	// 仅最后一条豁免（截断），之前的致命。
+	// 逐条扫描（记录以 '\n' 分隔；最后一段可能无结尾换行）。崩溃恢复规则：
+	//   - **无结尾换行的最后一段**：恒视为撕裂尾记录 → 截掉（即便能解析）。没有持久化的换行分隔符
+	//     就意味着下次 append 会把新记录直接拼到它后面成一条真损坏行；且该记录属未 Sync 批、源 id
+	//     未 Advance，resume 会重写，截断绝对安全。
+	//   - **有结尾换行的最后一条记录解析失败**：非原子写回下换行可能先于更早字节到盘，故也视为撕裂
+	//     → 截掉。
+	//   - **最后一条之前的任何记录解析失败**：append-only 顺序写下的真损坏（位翻转/篡改），致命。
 	var truncateAt int64 = -1
 	offset := 0
 	n := len(data)
 	for offset < n {
 		nl := bytes.IndexByte(data[offset:], '\n')
-		var line []byte
-		var lineEnd int // 本条记录末尾的下一个字节下标（含换行）
-		var isLast bool
 		if nl < 0 {
-			line = data[offset:]
-			lineEnd = n
-			isLast = true // 无结尾换行 ⇒ 必是最后的撕裂尾段
-		} else {
-			line = data[offset : offset+nl]
-			lineEnd = offset + nl + 1
-			isLast = lineEnd >= n // 换行后已无更多字节 ⇒ 这是最后一条记录
+			// 无结尾换行的最后一段：撕裂尾记录，整条截掉（不论能否解析）。
+			truncateAt = int64(offset)
+			break
 		}
+		line := data[offset : offset+nl]
+		lineEnd := offset + nl + 1
+		isLast := lineEnd >= n // 换行后已无更多字节 ⇒ 这是最后一条（已带分隔符的）记录
 		if len(bytes.TrimSpace(line)) == 0 {
 			offset = lineEnd // 跳过空行
 			continue
@@ -131,7 +132,7 @@ func loadSeen(path string) (map[string]int64, error) {
 		var rec dlqRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
 			if isLast {
-				truncateAt = int64(offset) // 从这条撕裂的最后记录起整条截掉
+				truncateAt = int64(offset) // 撕裂的最后记录（换行先到盘）→ 整条截掉
 				break
 			}
 			// 最后一条之前的完整记录损坏 = 真损坏，致命。
@@ -141,7 +142,7 @@ func loadSeen(path string) (map[string]int64, error) {
 		offset = lineEnd
 	}
 
-	// 截掉未 fsync 的撕裂尾记录（崩溃恢复），让文件回到「全是完整记录」的状态可继续 append。
+	// 截掉未 fsync 的撕裂尾记录（崩溃恢复），让文件回到「全是带分隔符的完整记录」状态可继续 append。
 	if truncateAt >= 0 {
 		if err := os.Truncate(path, truncateAt); err != nil {
 			return nil, fmt.Errorf("backfill: truncate torn trailing spill record (from byte %d) during crash recovery: %w", truncateAt, err)

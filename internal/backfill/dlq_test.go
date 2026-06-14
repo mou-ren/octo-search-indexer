@@ -311,3 +311,42 @@ func TestDLQSpill_TornSingleLineOnly(t *testing.T) {
 		t.Fatalf("count must be 0 after truncating the only (torn) line, got %d", s.Count())
 	}
 }
+
+// TestDLQSpill_ValidFinalRecordMissingNewlineTruncated 🔴 P1（精修2）：最后一条记录 JSON 完整可解析
+// 但缺结尾换行（崩溃时只丢了 '\n'）→ 仍视为撕裂截掉。否则文件无 NDJSON 分隔符，下次 append 会把
+// 新记录直接拼到它后面成一条真损坏行。截断后该源 id（未 Advance）resume 会重写，安全。
+func TestDLQSpill_ValidFinalRecordMissingNewlineTruncated(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	// 一条带换行的完整行 + 一条「合法 JSON 但无结尾换行」的最后记录。
+	noNL := validLine(t, "m2", 200)
+	noNL = noNL[:len(noNL)-1] // 去掉结尾换行
+	content := validLine(t, "m1", 100) + noNL
+	path := writeRawSpill(t, dir, content)
+
+	s, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("valid-but-newline-less final record must recover (truncate): %v", err)
+	}
+	// 截断后只剩第一条带分隔符的完整行。
+	if s.Count() != 1 {
+		t.Fatalf("count after truncating newline-less final record must be 1, got %d", s.Count())
+	}
+	// 续写一条新记录，重开应得 2 条（绝不和旧记录拼成损坏行）。
+	if err := s.Write(dlqRecord{MessageID: "m3", CreatedAt: 300}); err != nil {
+		t.Fatalf("write after recovery: %v", err)
+	}
+	if cerr := s.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	if got := countLines(string(mustRead(t, path))); got != 2 {
+		t.Fatalf("after recovery+append, file must have 2 clean NDJSON lines, got %d", got)
+	}
+	s2, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("reopen must parse cleanly (no concatenated corrupt line): %v", err)
+	}
+	defer mustCloseT(t, s2)
+	if s2.Count() != 2 {
+		t.Fatalf("reopen count must be 2, got %d", s2.Count())
+	}
+}
