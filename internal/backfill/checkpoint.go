@@ -149,5 +149,10 @@ func (s *CheckpointStore) persistLocked() error {
 		cleanup()
 		return fmt.Errorf("backfill: rename checkpoint into place: %w", err)
 	}
+	// rename 的目录项变更在父目录 fsync 前不保证落盘——checkpoint 推进后紧接崩溃可能丢失刚推进的
+	// 水位，削弱续传可靠性。复用 DLQ writer 同一道 fsyncDir（其 rename 后亦如此），让 rename 持久。
+	if err := fsyncDir(dir); err != nil {
+		return err
+	}
 	return nil
 }

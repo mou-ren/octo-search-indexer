@@ -1,6 +1,7 @@
 package backfill
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -88,5 +89,42 @@ func TestCheckpoint_CreatesParentDir(t *testing.T) {
 	}
 	if cp2.Get("message") != 5 {
 		t.Fatalf("checkpoint not persisted into created dir: %d", cp2.Get("message"))
+	}
+}
+
+// TestCheckpoint_PersistLeavesDurableDir Advance 后持久化路径（写临时文件 → rename → fsync 父目录）
+// 应是干净耐久状态：只剩最终 checkpoint 文件，无残留临时文件，且内容可重载。
+// （父目录 fsync 本身在单测里不可直接观测，这里断言 persist 路径完整收尾且 rename 已生效——
+//
+//	与 DLQ writer 同一道 fsyncDir，让 rename 目录项变更落盘、续传可靠。）
+func TestCheckpoint_PersistLeavesDurableDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cp.json")
+	cp, err := OpenCheckpoint(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for i := int64(1); i <= 3; i++ {
+		if err := cp.Advance("message", i); err != nil {
+			t.Fatalf("advance %d: %v", i, err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != "cp.json" {
+		t.Fatalf("persist must leave only the final checkpoint (no stray temp files), got %v", names)
+	}
+	cp2, err := OpenCheckpoint(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if cp2.Get("message") != 3 {
+		t.Fatalf("persisted watermark mismatch: %d", cp2.Get("message"))
 	}
 }
