@@ -31,7 +31,8 @@ octo-server 的读路径（`modules/messages_search`，PR#361/#374/#385）直查
 | `source` | keyword | source | 来源（ETL/CDC） |
 
 - **排序**：reader cursor sort = `timestamp` + `messageId`（dsl.go::applySort）。两字段都已就位。
-- **alias**：reader 读 `wukongim-messages-read`（pattern `wukongim-messages-*`）。新 mapping 内嵌该 alias。
+- **alias**：reader 读 `wukongim-messages-read`（pattern `wukongim-messages-*`）。**mapping 不再内嵌该 alias**
+  （v1.9 R2：裸 PUT 默认安全，建索引 ≠ 上线）——alias 只在迁移步骤③ reindex + 抽样对账通过后单独原子挂。
 
 ## 实时 consumer 路径 vs backfill 路径（关键差异）
 
@@ -53,8 +54,8 @@ octo-server 的读路径（`modules/messages_search`，PR#361/#374/#385）直查
 
 脚本：`scripts/forward-migrate.sh`（`make migrate-forward`）。
 
-1. **写新契约索引**（mapping v1.9）：`STEP=1`。建索引时剥离 aliases 段，alias 第③步单独原子挂，
-   保证 reindex 完成前 read alias 不指向半空新索引。
+1. **写新契约索引**（mapping v1.9）：`STEP=1`。mapping 已不含 aliases 段（裸 PUT 默认安全），
+   脚本仍兜底剥离；alias 第③步单独原子挂，保证 reindex 完成前 read alias 不指向半空新索引。
 2. **存量 reindex** 旧索引 → 新契约索引：`STEP=2`。painless 把 flat snake_case 映射成 camelCase 嵌套。
    - ⚠️ reindex 只能搬旧索引**已有**字段；spaceId/visibles/messageSeq 旧链没写 → 新 doc 这三字段空。
    - **存量富化**：要让存量 doc 带 spaceId/visibles/messageSeq，跑 backfill 重灌（`cmd/backfill`，
@@ -62,6 +63,8 @@ octo-server 的读路径（`modules/messages_search`，PR#361/#374/#385）直查
      重叠安全；重灌覆盖 reindex 的空字段。生产推荐：直接 backfill 重灌新索引，跳过 reindex 的空壳。
 3. **alias 原子切换** read alias → 新索引：`STEP=3`。**前置门**：先 `make run-recon RECON_ES_INDEX=<新索引>`
    抽样对账通过（doc_drift==0 且 sample_mismatch==0 且 sample_missing==0）再切。
+   切换在单个 `_aliases` 事务内 `remove(index="*", must_exist=false)` + `add(新索引)`：从**任意**当前
+   挂着的索引摘掉 alias 再挂新索引（幂等 + 保证 alias 任何时刻单指向，杜绝半新半旧同 alias）。
 
 ### 回滚
 - read alias 秒切回旧索引（脚本末尾 ROLLBACK 段）。

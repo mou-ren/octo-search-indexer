@@ -1,7 +1,9 @@
 package backfill
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/esindex"
 )
@@ -37,7 +39,18 @@ func docFromRow(row *srcMessageRow) (esindex.Doc, extractOutcome, error) {
 	}
 	// 加密消息 payload 是密文，不解析（与 extract 一致），spaceId/visibles 留空（reader fail-closed）。
 	if !isSignalEncrypted(row) {
-		spaceID, visibles := extractVisibility(row.Payload)
+		spaceID, visibles, verr := extractVisibility(row.Payload)
+		if verr != nil {
+			// 🔴 fail-CLOSED：可见性是 access-control ACL。一旦它无法可信解析（payload 非 JSON 对象、
+			// visibles 非数组等结构性损坏），**绝不**写空 visibles —— 否则 reader(doc.go:21) 把空
+			// visibles 当 fail-OPEN（群系统消息「仅管理员可见」白名单门被移除，普通成员能搜到管理员
+			// 可见消息）。这类行一律落 DLQ（永久跳过写入），把 ACL 解析失败显式暴露给对账门而非静默塌掉。
+			//
+			// 注意：space_id 的 JSON 类型（数字/对象/上游漂移）**不**触发此路径——extractVisibility 把
+			// space_id 解成容忍类型，非字符串 space_id 退化为空 spaceId（reader p2p fail-closed，安全方向），
+			// 绝不因一个字段类型怪异连累合法的 visibles 一并清空（V3b fail-OPEN 的根因）。
+			return esindex.Doc{}, outcomeDLQ, verr
+		}
 		doc.SpaceID = spaceID
 		doc.Visibles = visibles
 	}
@@ -45,28 +58,53 @@ func docFromRow(row *srcMessageRow) (esindex.Doc, extractOutcome, error) {
 }
 
 // extractVisibility 从原始 payload 字节解析 reader 鉴权所需的可见性字段：
-//   - space_id（string）：p2p space 召回过滤的真源。
+//   - space_id：p2p space 召回过滤的真源。**容忍类型**：仅当 JSON 字符串时取值，其余 JSON 类型
+//     （数字/对象/上游漂移）退化为空 spaceId（reader p2p fail-closed，安全方向）——绝不让 space_id
+//     的怪异类型炸掉整条 payload 的解析、连累合法 visibles 被清空（V3b fail-OPEN 根因）。
 //   - visibles（[]string，仅保留字符串元素，与 octo-server visiblesAllows 口径一致）：
 //     群系统消息白名单。空/缺失 → 空切片（reader：无 gate）。
 //
-// 解析失败（payload 非 JSON 对象，如加密/损坏）→ 返回空，保守不附加可见性约束
-// （与 reader/server visiblesAllows 对损坏 payload「不约束」一致，且 space 留空走 fail-closed）。
-func extractVisibility(payload []byte) (spaceID string, visibles []string) {
-	var v struct {
-		SpaceID  string            `json:"space_id"`
-		Visibles []json.RawMessage `json:"visibles"`
+// 🔴 fail-CLOSED 返回值契约：
+//   - payload 是合法 JSON 对象（即使含怪异字段类型）→ 返回解析出的 spaceID/visibles，err=nil。
+//   - payload **不是** JSON 对象（顶层非 `{...}`，如损坏/截断/数组/标量）→ 返回 err≠nil。
+//     调用方据此 fail-closed（落 DLQ），绝不把无法可信解析的行写成空 visibles（fail-OPEN）。
+//
+// 为何不再用 strict struct unmarshal：strict struct 里 `SpaceID string` 一旦遇非字符串 space_id
+// 会令**整个 struct** Unmarshal 失败 → 旧实现返回 "",nil → 合法 visibles 被静默清空 → reader
+// fail-OPEN。这正是本 PR 要堵的 V3b，却从 active backfill 路径重新引入。改用「先验顶层是对象，
+// 再字段级容忍解析」彻底切断「单字段类型 → 全可见性塌掉」的耦合。
+func extractVisibility(payload []byte) (spaceID string, visibles []string, err error) {
+	// 先把 payload 解成顶层对象（容忍每个字段的 JSON 类型）。顶层不是对象（损坏/截断/数组/标量）
+	// 才是真正「可见性不可信」→ fail-closed。space_id/visibles 字段本身的类型不在此判死。
+	var top map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	if derr := dec.Decode(&top); derr != nil {
+		return "", nil, fmt.Errorf("backfill: visibility payload not a JSON object (fail-closed): %w", derr)
 	}
-	if err := json.Unmarshal(payload, &v); err != nil {
-		return "", nil
-	}
-	spaceID = v.SpaceID
-	if len(v.Visibles) == 0 {
-		return spaceID, nil
-	}
-	out := make([]string, 0, len(v.Visibles))
-	for _, raw := range v.Visibles {
+
+	// space_id：容忍类型——仅 JSON 字符串取值，其余类型留空（不报错、不连累 visibles）。
+	if raw, ok := top["space_id"]; ok {
 		var s string
-		if err := json.Unmarshal(raw, &s); err != nil {
+		if uerr := json.Unmarshal(raw, &s); uerr == nil {
+			spaceID = s
+		}
+		// 非字符串 space_id（数字/对象/null）→ spaceID 留空（reader p2p fail-closed，安全方向）。
+	}
+
+	// visibles：必须是 JSON 数组（或缺失/null）。是别的类型（对象/标量/字符串）说明白名单结构损坏
+	// → fail-closed（绝不当作「无 gate」放空，那是 fail-OPEN）。
+	rawVis, ok := top["visibles"]
+	if !ok || string(rawVis) == "null" {
+		return spaceID, nil, nil
+	}
+	var elems []json.RawMessage
+	if uerr := json.Unmarshal(rawVis, &elems); uerr != nil {
+		return "", nil, fmt.Errorf("backfill: visibles is not a JSON array (fail-closed, refuse to drop ACL): %w", uerr)
+	}
+	out := make([]string, 0, len(elems))
+	for _, raw := range elems {
+		var s string
+		if uerr := json.Unmarshal(raw, &s); uerr != nil {
 			// 与 server visiblesAllows 一致：非字符串元素跳过，不当作约束。
 			continue
 		}
@@ -75,7 +113,7 @@ func extractVisibility(payload []byte) (spaceID string, visibles []string) {
 		}
 	}
 	if len(out) == 0 {
-		return spaceID, nil
+		return spaceID, nil, nil
 	}
-	return spaceID, out
+	return spaceID, out, nil
 }

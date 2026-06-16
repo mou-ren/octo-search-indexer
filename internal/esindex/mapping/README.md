@@ -14,7 +14,9 @@ v1.9 收敛索引契约到 **octo-server reader** 读的形态
   读 int64 做 cursor tiebreaker）。
 - 新增 reader 必读字段：`spaceId`(keyword) / `visibles`(keyword[]) / `messageSeq`(long)。
 - sort 字段 `timestamp`(epoch_second) + `messageId` 与 reader cursor sort 口径一致。
-- 内嵌 **alias `wukongim-messages-read`**（reader 读此 alias，pattern `wukongim-messages-*`）。
+- reader 读 **alias `wukongim-messages-read`**（pattern `wukongim-messages-*`）。**本 mapping 不再内嵌该
+  alias**（v1.9 R2）：`EnsureIndex` 用本文件裸 PUT 建索引，若内嵌 alias 会让新索引一建好就被 reader
+  读到（reindex/backfill 完成前的半量数据）。alias 改由迁移脚本步骤③在对账通过后单独原子挂。
 
 完整迁移说明见 `docs/forward-migration-v1.9.md`。
 

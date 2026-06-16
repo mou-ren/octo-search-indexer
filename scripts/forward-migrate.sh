@@ -20,20 +20,25 @@ CURL=(curl -sS -H 'Content-Type: application/json')
 
 log(){ printf '\n=== %s ===\n' "$*"; }
 
-# 注意：脚本内嵌的 mapping JSON 含 aliases.wukongim-messages-read，会让新索引建好即挂 read alias。
-# 为保证「reindex 完成前不切 alias」，建新索引时**剥离 aliases 段**，alias 在步骤③单独原子挂。
+# mapping 文件本身**不再内嵌** read alias（v1.9 R2：裸 PUT 默认安全——EnsureIndex / 本脚本建索引
+# 时不会让新索引一建好就挂上 read alias，避免 reindex 完成前就被 reader 读到半量数据）。alias 只在
+# 步骤③ reindex + 抽样对账通过后单独原子挂。这里仍 del(.aliases) 兜底：若有人把 alias 加回 mapping，
+# 此处仍剥离，保证「建索引 ≠ 上线」的纪律不被 mapping 改动悄悄破坏。
 new_index_body(){
-  # 用 jq 去掉 aliases 段（若无 jq，则要求 MAPPING_NOALIAS_FILE 预先准备）。
+  # 用 jq 去掉 aliases 段（mapping 现已无该段，del 为幂等 no-op；保留以防 mapping 回退加回 alias）。
   if command -v jq >/dev/null 2>&1; then
     jq 'del(.aliases)' "$MAPPING_FILE"
-  else
-    echo "ERROR: jq required to strip aliases for staged migration (or set MAPPING_NOALIAS_FILE)" >&2
+  elif grep -q '"aliases"' "$MAPPING_FILE"; then
+    echo "ERROR: mapping embeds an aliases section but jq is unavailable to strip it for staged migration (set MAPPING_NOALIAS_FILE)" >&2
     exit 3
+  else
+    # mapping 无 aliases 段（当前状态）：无 jq 也安全，裸 PUT 不会提前挂 alias。
+    cat "$MAPPING_FILE"
   fi
 }
 
 step1_create_new(){
-  log "① 创建新契约索引 $NEW_INDEX (mapping v1.9，剥离 aliases 段)"
+  log "① 创建新契约索引 $NEW_INDEX (mapping v1.9，无内嵌 alias / 兜底剥离 aliases 段)"
   new_index_body | "${CURL[@]}" -XPUT "$ES/$NEW_INDEX" -d @- | tee /dev/stderr | grep -q '"acknowledged":true'
 }
 
@@ -56,11 +61,16 @@ JSON
 }
 
 step3_switch_alias(){
-  log "③ 原子切换 read alias $ALIAS → $NEW_INDEX（移除旧索引上的同名 alias）"
+  log "③ 原子切换 read alias $ALIAS → $NEW_INDEX（从所有索引摘掉同名 alias 再挂新索引，幂等且单指向）"
+  # 🔴 单指向不变式：read alias **任何时刻只能指向一个索引**（禁半新半旧同 alias 服务）。故 remove
+  # 用 index="*"（摘掉 alias 当前挂着的**任意**索引，不只是 OLD_INDEX）—— 若只 remove OLD_INDEX，
+  # 而 alias 当前其实挂在别的索引上（OLD_INDEX 名传错 / 历史迁移残留），remove 会 no-op，add 后 alias
+  # 就同时指向那个旧索引 + NEW_INDEX（reader 读到半量数据）。配 must_exist:false：首次迁移 alias 尚
+  # 不存在时 remove 不报错。整个 _aliases 调用是**原子**的（remove+add 同事务），无中间真空态。
   "${CURL[@]}" -XPOST "$ES/_aliases" -d @- <<JSON | tee /dev/stderr | grep -q '"acknowledged":true'
 {
   "actions": [
-    { "remove": { "index": "$OLD_INDEX", "alias": "$ALIAS" } },
+    { "remove": { "index": "*", "alias": "$ALIAS", "must_exist": false } },
     { "add":    { "index": "$NEW_INDEX", "alias": "$ALIAS" } }
   ]
 }

@@ -89,6 +89,30 @@ independent binary/image distinct from `octo-server`.
 > + 中文 analyzer bootstrap. `/metrics` and lag/backlog instrumentation land in
 > phase 7.
 
+## Backfill & reconciliation (must-run gate)
+
+The phase-6 backfill job (`cmd/backfill`) loads existing `message` shards into
+OpenSearch, bypassing Kafka, and is the **only** path that fills the reader's
+safety fields (`spaceId`/`visibles`/`messageSeq`) from the raw MySQL payload.
+
+A count match alone does not prove correctness — it proves only that the row
+*counts* tie, not that each doc's authz/correctness fields are right. **Always run
+the field-level reconciliation gate after a backfill:**
+
+```sh
+# inline after the backfill run (uses the job's own exact DLQ count as authority):
+go run ./cmd/backfill ... -reconcile -from <epoch> -to <epoch>   # count gate + field-level sample gate
+
+# or standalone, any time:
+make run-recon RECON_FROM=<epoch> RECON_TO=<epoch> RECON_DLQ=<dlq-count>
+```
+
+The sample gate cross-checks `messageId` (full precision), `channelId`,
+`channelType`, `spaceId`, and **`visibles`** between MySQL and the ES doc, so a
+silently dropped ACL (`visibles`) field surfaces as `sample_mismatch>0` and the
+gate exits non-zero. `make run-recon` is **mandatory** before switching the read
+alias to a freshly backfilled index (see `docs/forward-migration-v1.9.md`).
+
 ## Build
 
 ```sh

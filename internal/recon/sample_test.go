@@ -227,3 +227,43 @@ func TestCompareSamples_MessageIDPrecisionDrift(t *testing.T) {
 		t.Fatalf("mismatch detail must name messageId: %+v", res.Details)
 	}
 }
+
+// TestParsePayloadVisibility_NotBlindToNonStringSpaceID 🔴 验证门不盲于写入路径 V3b bug 的核心断言。
+//
+// 写入路径的 bug：非字符串 space_id 把整条 payload 解坏 → 合法 visibles 被清空（fail-OPEN）。
+// 若验证门用同样的 strict-struct 解析器，它从 MySQL 取出的 visibles 也会被同一 bug 清空 → 两侧
+// 同为空 → 抽样比对「相等」→ 门对该 bug **全盲**。本测试钉死：recon 门独立的 parsePayloadVisibility
+// 在 space_id 为非字符串时**仍能正确取出合法 visibles**（不被连累），因此一旦写入路径错误地丢了
+// 该行 visibles，门取出的权威 visibles 与 ES 的空 visibles 就会失配 → 门转红。
+func TestParsePayloadVisibility_NotBlindToNonStringSpaceID(t *testing.T) {
+	// space_id 是数字、visibles 合法——正是触发写入路径 fail-OPEN 的 payload。
+	payload := []byte(`{"space_id":99999,"visibles":["admin1","admin2"]}`)
+	sid, vis := parsePayloadVisibility(payload)
+	if sid != "" {
+		t.Fatalf("non-string space_id must degrade to empty (not blind, but no false value): %q", sid)
+	}
+	if len(vis) != 2 || vis[0] != "admin1" || vis[1] != "admin2" {
+		t.Fatalf("recon gate must still recover legitimate visibles (else gate is blind to V3b): %+v", vis)
+	}
+}
+
+// TestCompareSamples_CatchesWritePathVisiblesDrop 端到端：模拟写入路径因非字符串 space_id 丢了
+// 合法 visibles（ES doc visibles 为空），而 MySQL 源行 visibles 合法。门必须判 mismatch（非全盲）。
+func TestCompareSamples_CatchesWritePathVisiblesDrop(t *testing.T) {
+	// 源行的 SpaceID/Visibles 由 parsePayloadVisibility 从 payload 解出（这里直接构造其等价结果）：
+	// 非字符串 space_id → SpaceID 空，但 visibles 合法保留。
+	src := &fakeSampleSrc{rows: []SampleRow{
+		{MessageID: "21", ChannelID: "g", ChannelType: 1, SpaceID: "", Visibles: []string{"admin1", "admin2"}},
+	}}
+	// ES doc 是被 bug 写坏的形态：visibles 被清空（fail-OPEN）。
+	es := &fakeESFetch{docs: map[string]ESDocFields{
+		"21": {MessageID: 21, ChannelID: "g", ChannelType: 1, SpaceID: "", Visibles: nil},
+	}}
+	res, err := CompareSamples(context.Background(), src, es, 0, 100, 100, 50)
+	if err != nil {
+		t.Fatalf("CompareSamples: %v", err)
+	}
+	if res.Mismatch != 1 {
+		t.Fatalf("dropped visibles (fail-OPEN) must be caught as mismatch, gate not blind: %+v", res)
+	}
+}

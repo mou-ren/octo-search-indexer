@@ -291,17 +291,39 @@ func scanSampleRows(rows *sql.Rows) (out []SampleRow, err error) {
 // signalSettingMask 是 setting 字节里 Signal 加密位（bit5），与 backfill/extract 同口径。
 const signalSettingMask = 1 << 5
 
-// parsePayloadVisibility 解出 payload.space_id / payload.visibles（与 backfill extractVisibility 同口径）。
+// parsePayloadVisibility 解出 payload.space_id / payload.visibles（reader 契约的权威可见性值）。
+//
+// 🔴 验证门独立实现，**不复用** backfill.extractVisibility（写入路径解析器）。这是设计要点：
+// 若验证门与写入路径共用同一个解析器，写入路径的解析 bug（如非字符串 space_id 把整条 payload
+// 解坏 → visibles 被清空）会让两侧**同时**产出空 visibles → 抽样比对「相等」→ 门对该 bug 全盲。
+// 本函数独立、类型容忍地解析可见性：space_id 仅当 JSON 字符串时取值（其余类型留空，与 reader p2p
+// fail-closed 一致），visibles 字段级容忍——**绝不**让 space_id 的怪异 JSON 类型连累 visibles 被
+// 清空。故一旦写入路径错误地丢了某行合法 visibles，本门从 MySQL 取出的权威 visibles 与 ES doc 的
+// 空 visibles 失配 → sample_mismatch>0 → 门转红，bug 无所遁形。
 func parsePayloadVisibility(payload []byte) (spaceID string, visibles []string) {
-	var v struct {
-		SpaceID  string            `json:"space_id"`
-		Visibles []json.RawMessage `json:"visibles"`
-	}
-	if err := json.Unmarshal(payload, &v); err != nil {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &top); err != nil {
+		// 顶层非 JSON 对象（损坏/截断）：MySQL 侧也取不出可见性。写入路径对这类行 fail-closed 落
+		// DLQ（被 excluded 集排除，不进比对），故这里返回空不会误判合法行。
 		return "", nil
 	}
-	spaceID = v.SpaceID
-	for _, raw := range v.Visibles {
+	// space_id：容忍类型——仅 JSON 字符串取值，非字符串（数字/对象/null）留空，且**不**连累 visibles。
+	if raw, ok := top["space_id"]; ok {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			spaceID = s
+		}
+	}
+	// visibles：必须是 JSON 数组才逐元素取字符串；其余类型留空（写入路径对此 fail-closed 落 DLQ）。
+	rawVis, ok := top["visibles"]
+	if !ok || string(rawVis) == "null" {
+		return spaceID, nil
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal(rawVis, &elems); err != nil {
+		return spaceID, nil
+	}
+	for _, raw := range elems {
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil {
 			continue
