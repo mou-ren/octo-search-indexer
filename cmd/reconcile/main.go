@@ -12,12 +12,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +50,11 @@ func run() error {
 		esUser   = flag.String("es-user", os.Getenv("RECON_ES_USER"), "OpenSearch username")
 		esPass   = flag.String("es-pass", os.Getenv("RECON_ES_PASS"), "OpenSearch password")
 		dlq      = flag.Int64("dlq", 0, "known DLQ count in window (rows that never reached ES body index)")
+		sampleN  = flag.Int("sample", envInt("RECON_SAMPLE", 200), "field-level sample size (0 disables sampling)")
+		maxDet   = flag.Int("sample-max-details", envInt("RECON_SAMPLE_MAX_DETAILS", 50), "cap on mismatch detail entries in the report")
+		jsonOut  = flag.Bool("json", false, "emit the structured FullReport as JSON")
+		pushURL  = flag.String("push-url", os.Getenv("RECON_PUSH_URL"), "optional octo-server ingestion URL to POST the search_recon gauge payload")
+		pushTok  = flag.String("push-token", os.Getenv("RECON_PUSH_TOKEN"), "optional bearer token for -push-url")
 		timeout  = flag.Duration("timeout", 60*time.Second, "overall timeout")
 	)
 	flag.Parse()
@@ -114,12 +123,79 @@ func run() error {
 		// 输入不自洽（DLQ accounting 加固，阶段 6 (f)）：拒绝在可疑计数上判 OK。
 		return err
 	}
-	fmt.Println(report.String())
-	if !report.OK {
-		// 不对平：退出码 2，作为 backfill/CI gate 的失败信号。
+
+	full := recon.FullReport{Count: report, RanAtUnixSeconds: time.Now().Unix()}
+	full.Window.FromUnix = *fromUnix
+	full.Window.ToUnix = to
+
+	// 抽样字段比对（步骤 5 核心：count 对账不证内容一致）。
+	if *sampleN > 0 {
+		sampleReader := recon.NewMySQLSampleReader(db, splitCSV(*tablesS))
+		docFetcher := recon.NewOSDocFetcher(osClient, *esIndex)
+		sample, serr := recon.CompareSamples(ctx, sampleReader, docFetcher, *fromUnix, to, *sampleN, *maxDet)
+		if serr != nil {
+			return serr
+		}
+		full.Sample = sample
+	}
+
+	// 回填 octo-server 只读 search_recon_* gauge（可选）。push 失败不改变对账结论，但要显式告警。
+	if *pushURL != "" {
+		if perr := pushReport(ctx, *pushURL, *pushTok, full.PushPayload()); perr != nil {
+			log.Printf("warn: push recon payload to %s failed: %v", *pushURL, perr)
+		}
+	}
+
+	if *jsonOut {
+		b, jerr := json.MarshalIndent(full, "", "  ")
+		if jerr != nil {
+			return fmt.Errorf("marshal report: %w", jerr)
+		}
+		fmt.Println(string(b))
+	} else {
+		fmt.Println(full.String())
+	}
+
+	if !full.Healthy() {
+		// 不对平（count 或抽样 drift）：退出码 2，作为 backfill/CI/cron gate 的失败信号。
 		os.Exit(2)
 	}
 	return nil
+}
+
+// pushReport POST 结构化 gauge 载荷到 octo-server 只读 ingestion 端（载荷逐字段对齐
+// recon_metrics.go::ReconReport）。仅在 -push-url 配置时调用。
+func pushReport(ctx context.Context, url, token string, payload recon.PushPayload) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal push payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("push returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func envOr(k, def string) string {

@@ -66,7 +66,7 @@ func TestOSCounter_IncompleteShards(t *testing.T) {
 	}
 }
 
-// TestOSCounter_RawExcludedQuery raw_excluded 计数走 term filter，正常返回。
+// TestOSCounter_RawExcludedQuery rawExcluded 计数走 term filter，正常返回。
 func TestOSCounter_RawExcludedQuery(t *testing.T) {
 	var gotBody string
 	c := osCounter(t, rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -81,7 +81,7 @@ func TestOSCounter_RawExcludedQuery(t *testing.T) {
 	if err != nil || n != 7 {
 		t.Fatalf("want 7,nil got %d,%v", n, err)
 	}
-	if !strings.Contains(gotBody, "raw_excluded") || !strings.Contains(gotBody, "created_at") {
-		t.Fatalf("raw_excluded query must filter on raw_excluded + created_at: %s", gotBody)
+	if !strings.Contains(gotBody, "rawExcluded") || !strings.Contains(gotBody, "createdAt") {
+		t.Fatalf("rawExcluded query must filter on rawExcluded + createdAt: %s", gotBody)
 	}
 }

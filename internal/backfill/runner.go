@@ -6,7 +6,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/esindex"
 )
 
@@ -134,7 +133,7 @@ func (r *Runner) runTable(ctx context.Context, table string) (Stats, error) {
 // 不致 dedup 塌缩 / 计数偏低）。
 type mainItem struct {
 	row *srcMessageRow
-	msg searchmsg.Message
+	doc esindex.Doc
 }
 
 // processBatch 处理一批（同分表、按 id 升序）：抽取三态分流 → 真异常落 DLQ spill →
@@ -146,15 +145,22 @@ func (r *Runner) processBatch(ctx context.Context, table string, rows []*srcMess
 	s.Read += int64(len(rows))
 	main := make([]mainItem, 0, len(rows))
 	for _, row := range rows {
-		msg, outcome := extractMessage(row)
-		switch outcome {
-		case outcomeDLQ:
-			// 真异常（payload 本应可解析却失败）：落本地 DLQ spill 并计数（fail-closed）。
-			if err := r.dlq.Write(dlqRecord{
-				Table: table, ID: row.ID, MessageID: row.MessageID,
+		// docFromRow 复用 extractMessage 的三态口径，并富化 reader 必读的
+		// spaceId/visibles/messageSeq（仅 backfill 可从原始 MySQL payload 自源填）。
+		doc, outcome, err := docFromRow(row)
+		switch {
+		case outcome == outcomeDLQ:
+			// 真异常（payload 解析失败 / message_id 非数值）：落本地 DLQ spill 并计数（fail-closed）。
+			reason := "payload_parse"
+			if err != nil {
+				reason = "doc_convert"
+			}
+			if werr := r.dlq.Write(dlqRecord{
+				Reason: reason,
+				Table:  table, ID: row.ID, MessageID: row.MessageID,
 				Payload: row.Payload, CreatedAt: row.CreatedUnix,
-			}); err != nil {
-				return err
+			}); werr != nil {
+				return werr
 			}
 			s.DLQ++
 			s.DLQPayload++
@@ -162,7 +168,7 @@ func (r *Runner) processBatch(ctx context.Context, table string, rows []*srcMess
 			if outcome == outcomeRawExcluded {
 				s.RawExcluded++
 			}
-			main = append(main, mainItem{row: row, msg: msg})
+			main = append(main, mainItem{row: row, doc: doc})
 		}
 	}
 	return r.writeMain(ctx, table, main, s)
@@ -185,11 +191,11 @@ func (r *Runner) writeMain(ctx context.Context, table string, main []mainItem, s
 				return err
 			}
 		}
-		msgs := make([]searchmsg.Message, len(remaining))
+		docs := make([]esindex.Doc, len(remaining))
 		for i := range remaining {
-			msgs[i] = remaining[i].msg
+			docs[i] = remaining[i].doc
 		}
-		results, err := r.writer.Bulk(ctx, msgs)
+		results, err := r.writer.BulkDocs(ctx, docs)
 		if err != nil {
 			// 批级 transient：保持 remaining 不变，下轮整批重试。
 			r.logf("backfill: bulk batch-level transient (table=%s n=%d attempt=%d): %v",

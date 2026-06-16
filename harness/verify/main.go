@@ -85,18 +85,18 @@ func main() {
 	check("consumer-group-drained", drainErr)
 
 	// Positives: these poll until present, confirming healthy indexing.
-	// Invariant: idempotency — duplicate message_id => exactly one doc.
-	check("idempotent-dup", v.expectDocExists(ctx, "m-dup"))
-	check("idempotent-count", v.expectCount(ctx, term("message_id", "m-dup"), 1))
+	// Invariant: idempotency — duplicate message_id => exactly one doc (_id = normalized messageId).
+	check("idempotent-dup", v.expectDocExists(ctx, "1000000000000000004"))
+	check("idempotent-count", v.expectCount(ctx, term("messageId", "1000000000000000004"), 1))
 
 	// Invariant: raw_excluded doc IS indexed (content null), occupies a doc.
-	check("raw-excluded-indexed", v.expectDocExists(ctx, "m-signal"))
+	check("raw-excluded-indexed", v.expectDocExists(ctx, "1000000000000000005"))
 
-	// Invariant: IK tokenization — Chinese query term recalls the doc.
-	check("ik-recall-公园", v.expectMatchAtLeast(ctx, "content", "公园", 1))
-	check("ik-recall-北京", v.expectMatchAtLeast(ctx, "content", "北京", 1))
+	// Invariant: IK tokenization — Chinese query term recalls the doc (reader nested field).
+	check("ik-recall-公园", v.expectMatchAtLeast(ctx, "payload.text.content", "公园", 1))
+	check("ik-recall-北京", v.expectMatchAtLeast(ctx, "payload.text.content", "北京", 1))
 	// English still works.
-	check("en-recall-pipeline", v.expectMatchAtLeast(ctx, "content", "pipeline", 1))
+	check("en-recall-pipeline", v.expectMatchAtLeast(ctx, "payload.text.content", "pipeline", 1))
 
 	// 🔴 C4 schema gate — verify BOTH directions:
 	//  (1) positive: the DLQ topic actually CONTAINS the poison-pill keys (routing happened);
@@ -104,8 +104,8 @@ func main() {
 	// The negative assertions only stand once the group is proven drained.
 	check("dlq-contains-poison", kv.expectDLQKeys(ctx, *dlqTopic, []string{"m-badschema", "m-badjson"}, fence, 60*time.Second))
 	if drainErr == nil {
-		check("badschema-not-indexed", v.expectCount(ctx, term("message_id", "m-badschema"), 0))
-		check("badjson-not-indexed", v.expectCount(ctx, term("message_id", "m-badjson"), 0))
+		check("badschema-not-indexed", v.expectCount(ctx, term("_id", "m-badschema"), 0))
+		check("badjson-not-indexed", v.expectCount(ctx, term("_id", "m-badjson"), 0))
 	} else {
 		failures = append(failures, "badschema/badjson: skipped — consumer drain not proven")
 		log.Printf("FAIL badschema/badjson: skipped — consumer drain not proven (%v)", drainErr)

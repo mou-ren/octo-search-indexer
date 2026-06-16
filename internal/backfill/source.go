@@ -37,7 +37,7 @@ func (s *MySQLSource) ReadBatch(ctx context.Context, table string, after int64, 
 		return nil, fmt.Errorf("backfill: unsafe table name %q", table)
 	}
 	q := fmt.Sprintf(
-		"SELECT id, message_id, from_uid, channel_id, channel_type, setting, `signal`, "+
+		"SELECT id, message_id, message_seq, from_uid, channel_id, channel_type, setting, `signal`, "+
 			"`timestamp`, UNIX_TIMESTAMP(created_at) AS created_unix, payload "+
 			"FROM `%s` WHERE id>? ORDER BY id ASC LIMIT ?", table)
 	rows, err := s.db.QueryContext(ctx, q, after, limit)
@@ -54,7 +54,7 @@ func (s *MySQLSource) ReadBatch(ctx context.Context, table string, after int64, 
 	for rows.Next() {
 		var r srcMessageRow
 		if err := rows.Scan(
-			&r.ID, &r.MessageID, &r.FromUID, &r.ChannelID, &r.ChannelType,
+			&r.ID, &r.MessageID, &r.MessageSeq, &r.FromUID, &r.ChannelID, &r.ChannelType,
 			&r.Setting, &r.Signal, &r.Timestamp, &r.CreatedUnix, &r.Payload,
 		); err != nil {
 			return nil, fmt.Errorf("backfill: scan %s: %w", table, err)

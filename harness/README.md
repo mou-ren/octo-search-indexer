@@ -7,6 +7,11 @@ seed → Kafka octo.message.v1 → es-indexer consumer → OpenSearch (analysis-
                                       └→ octo.message.v1.dlq (poison pills)
 ```
 
+> **v1.9 契约收敛（YUJ-4534 阶段 8）**：索引 doc 已收敛到 octo-server reader 形态
+> （camelCase 嵌套，`messageId`(long) / `payload.text.content`(IK) / `spaceId` / `visibles` /
+> `messageSeq`，alias `wukongim-messages-read`）。harness 的 message_id 因此用**数值** snowflake 串
+> （reader 读 `messageId` 为 long；非数值串会被判毒丸进 DLQ）。详见 `docs/forward-migration-v1.9.md`。
+
 > 🔒 **Isolation.** This is a local-only stack (`docker compose`). It is NEVER
 > wired into a shared test environment, and the indexer's `Kafka.On` / real
 > deployment wiring stays off until a separate, explicitly signed-off step.

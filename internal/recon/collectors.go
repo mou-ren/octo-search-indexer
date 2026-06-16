@@ -95,19 +95,19 @@ func NewOSCounter(client *opensearchapi.Client, index string) *OSCounter {
 	return &OSCounter{client: client, index: index}
 }
 
-// CountDocs 统计 created_at ∈ [from,to] 的 doc 数（range query + _count）。
+// CountDocs 统计 createdAt ∈ [from,to] 的 doc 数（range query + _count）。
 func (c *OSCounter) CountDocs(ctx context.Context, fromUnix, toUnix int64) (int64, error) {
 	return c.count(ctx, rangeQuery(fromUnix, toUnix))
 }
 
-// CountRawExcluded 统计窗内 raw_excluded=true 的 doc 数。
+// CountRawExcluded 统计窗内 rawExcluded=true 的 doc 数。
 func (c *OSCounter) CountRawExcluded(ctx context.Context, fromUnix, toUnix int64) (int64, error) {
 	body := map[string]any{
 		"query": map[string]any{
 			"bool": map[string]any{
 				"filter": []any{
 					rangeFilter(fromUnix, toUnix),
-					map[string]any{"term": map[string]any{"raw_excluded": true}},
+					map[string]any{"term": map[string]any{"rawExcluded": true}},
 				},
 			},
 		},
@@ -136,7 +136,7 @@ func (c *OSCounter) count(ctx context.Context, query map[string]any) (int64, err
 	return int64(resp.Count), nil
 }
 
-// rangeQuery 构造 created_at ∈ [from,to] 的 _count 查询体。
+// rangeQuery 构造 createdAt ∈ [from,to] 的 _count 查询体。
 func rangeQuery(fromUnix, toUnix int64) map[string]any {
 	return map[string]any{
 		"query": map[string]any{
@@ -150,7 +150,7 @@ func rangeQuery(fromUnix, toUnix int64) map[string]any {
 func rangeFilter(fromUnix, toUnix int64) map[string]any {
 	return map[string]any{
 		"range": map[string]any{
-			"created_at": map[string]any{"gte": fromUnix, "lte": toUnix},
+			"createdAt": map[string]any{"gte": fromUnix, "lte": toUnix},
 		},
 	}
 }

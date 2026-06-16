@@ -92,6 +92,7 @@ func seed(ctx context.Context, dsn string, tables []string, base int64) error {
 	rows := []struct {
 		table       string
 		mid         string
+		messageSeq  int64
 		fromUID     string
 		channelID   string
 		channelType uint8
@@ -99,18 +100,20 @@ func seed(ctx context.Context, dsn string, tables []string, base int64) error {
 		signal      int
 		payload     string
 	}{
-		{t0, "h-en", "u1", "g1", 2, 0, 0, `{"type":1,"content":"hello world pipeline"}`},
-		{t0, "h-zh1", "u1", "g1", 2, 0, 0, `{"type":1,"content":"今天天气很好我们去公园散步吧"}`},
-		{t1, "h-zh2", "u2", "g1", 2, 0, 0, `{"type":1,"content":"搜索引擎中文分词测试北京欢迎你"}`},
-		{t1, "h-signal", "u3", "u3@u4", 1, 0, 1, `ENCRYPTED-NOT-JSON`},
-		{t0, "h-image", "u1", "g1", 2, 0, 0, `{"type":2,"url":"http://x/y.png"}`},
-		{t1, "h-bad", "u2", "g1", 2, 0, 0, `{not valid json`},
+		// 含 space_id（p2p）→ 验证 backfill 富化 reader 必读的 spaceId（V1b）。
+		{t0, "3000000000000000001", 11, "u1", "g1", 2, 0, 0, `{"type":1,"content":"hello world pipeline","space_id":"space-A"}`},
+		{t0, "3000000000000000002", 12, "u1", "g1", 2, 0, 0, `{"type":1,"content":"今天天气很好我们去公园散步吧"}`},
+		// 含 visibles（群系统消息白名单）→ 验证 backfill 富化 reader 必读的 visibles（V3b）。
+		{t1, "3000000000000000003", 13, "u2", "g1", 2, 0, 0, `{"type":1,"content":"搜索引擎中文分词测试北京欢迎你","visibles":["admin1"]}`},
+		{t1, "3000000000000000004", 14, "u3", "u3@u4", 1, 0, 1, `ENCRYPTED-NOT-JSON`},
+		{t0, "3000000000000000005", 15, "u1", "g1", 2, 0, 0, `{"type":2,"url":"http://x/y.png"}`},
+		{t1, "3000000000000000006", 16, "u2", "g1", 2, 0, 0, `{not valid json`},
 	}
 	for i, r := range rows {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(
-			"INSERT INTO `%s` (message_id, from_uid, channel_id, channel_type, setting, `signal`, `timestamp`, created_at, payload) "+
-				"VALUES (?,?,?,?,?,?,?,FROM_UNIXTIME(?),?)", r.table),
-			r.mid, r.fromUID, r.channelID, r.channelType, r.setting, r.signal, base, base+int64(i), r.payload,
+			"INSERT INTO `%s` (message_id, message_seq, from_uid, channel_id, channel_type, setting, `signal`, `timestamp`, created_at, payload) "+
+				"VALUES (?,?,?,?,?,?,?,?,FROM_UNIXTIME(?),?)", r.table),
+			r.mid, r.messageSeq, r.fromUID, r.channelID, r.channelType, r.setting, r.signal, base, base+int64(i), r.payload,
 		); err != nil {
 			return fmt.Errorf("insert %s: %w", r.mid, err)
 		}
@@ -134,6 +137,7 @@ func createTable(ctx context.Context, db *sql.DB, table string) error {
 		"CREATE TABLE `%s` ("+
 			"id BIGINT AUTO_INCREMENT PRIMARY KEY, "+
 			"message_id VARCHAR(20) NOT NULL, "+
+			"message_seq BIGINT NOT NULL DEFAULT 0, "+
 			"from_uid VARCHAR(40) NOT NULL DEFAULT '', "+
 			"channel_id VARCHAR(100) NOT NULL DEFAULT '', "+
 			"channel_type TINYINT UNSIGNED NOT NULL DEFAULT 0, "+
@@ -181,15 +185,15 @@ func verify(ctx context.Context, esURL, index string, base int64) error {
 		log.Printf("PASS: raw_excluded=%d (Signal + non-text, still occupy ES docs)", rawEx)
 	}
 	// Positively assert the bad-JSON row is NOT in ES (it went to DLQ spill).
-	badPresent, err := count(ctx, client, index, idsQuery("h-bad"))
+	badPresent, err := count(ctx, client, index, idsQuery("3000000000000000006"))
 	if err != nil {
 		return err
 	}
 	if badPresent != 0 {
-		log.Printf("FAIL: real-anomaly row h-bad must NOT be in ES, found %d", badPresent)
+		log.Printf("FAIL: real-anomaly row 3000000000000000006 must NOT be in ES, found %d", badPresent)
 		fail = true
 	} else {
-		log.Printf("PASS: real-anomaly row h-bad absent from ES (routed to DLQ spill)")
+		log.Printf("PASS: real-anomaly row 3000000000000000006 absent from ES (routed to DLQ spill)")
 	}
 	if fail {
 		return fmt.Errorf("backfill e2e verification FAILED")
@@ -224,7 +228,7 @@ func rangeQuery(from, to int64) map[string]any {
 func rawExcludedQuery(from, to int64) map[string]any {
 	return map[string]any{"query": map[string]any{"bool": map[string]any{"filter": []any{
 		rangeFilter(from, to),
-		map[string]any{"term": map[string]any{"raw_excluded": true}},
+		map[string]any{"term": map[string]any{"rawExcluded": true}},
 	}}}}
 }
 
@@ -233,7 +237,7 @@ func idsQuery(id string) map[string]any {
 }
 
 func rangeFilter(from, to int64) map[string]any {
-	return map[string]any{"range": map[string]any{"created_at": map[string]any{"gte": from, "lte": to}}}
+	return map[string]any{"range": map[string]any{"createdAt": map[string]any{"gte": from, "lte": to}}}
 }
 
 func mustClose(db *sql.DB) {

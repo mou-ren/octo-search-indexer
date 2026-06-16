@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -64,22 +65,28 @@ func newFakeWriter() *fakeWriter {
 func (w *fakeWriter) EnsureIndex(context.Context) error { return w.ensureErr }
 func (w *fakeWriter) Close() error                      { return nil }
 
-func (w *fakeWriter) Bulk(_ context.Context, msgs []searchmsg.Message) ([]esindex.BulkItemResult, error) {
+// Bulk 不被 backfill 路径调用（backfill 走 BulkDocs(docs)）；提供接口实现。
+func (w *fakeWriter) Bulk(_ context.Context, _ []searchmsg.Message) ([]esindex.BulkItemResult, error) {
+	return nil, nil
+}
+
+// BulkDocs 模拟 backfill 写入：按规范化 messageId（= ES _id）注入每条结果。
+func (w *fakeWriter) BulkDocs(_ context.Context, docs []esindex.Doc) ([]esindex.BulkItemResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.bulkCalls++
 	if w.bulkErr != nil {
 		err := w.bulkErr
 		w.bulkErr = nil // 自愈：下一轮成功
-		out := make([]esindex.BulkItemResult, len(msgs))
-		for i := range msgs {
-			out[i] = esindex.BulkItemResult{MessageID: msgs[i].MessageID, OK: false, Status: 0, Err: err}
+		out := make([]esindex.BulkItemResult, len(docs))
+		for i := range docs {
+			out[i] = esindex.BulkItemResult{MessageID: docID(docs[i]), OK: false, Status: 0, Err: err}
 		}
 		return out, err
 	}
-	out := make([]esindex.BulkItemResult, len(msgs))
-	for i := range msgs {
-		id := msgs[i].MessageID
+	out := make([]esindex.BulkItemResult, len(docs))
+	for i := range docs {
+		id := docID(docs[i])
 		switch {
 		case w.transient[id] > 0:
 			w.transient[id]--
@@ -93,6 +100,9 @@ func (w *fakeWriter) Bulk(_ context.Context, msgs []searchmsg.Message) ([]esinde
 	}
 	return out, nil
 }
+
+// docID 返回 doc 的规范化 _id（int64 messageId 转十进制串），与生产 encodeBulkBody 一致。
+func docID(d esindex.Doc) string { return strconv.FormatInt(d.MessageID, 10) }
 
 // uniqueIndexed 返回成功写入的去重 message_id 数（ES `_id` 幂等下 = doc 数）。
 func (w *fakeWriter) uniqueIndexed() int {
@@ -130,7 +140,7 @@ func newTestRunner(t *testing.T, cfg Config, src SourceReader, w esindex.Writer)
 // TestRunner_HappyPath 全文本行 → 全部写 ES，无 DLQ，checkpoint 推进到批末。
 func TestRunner_HappyPath(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
-		"message": {textRow(1, "a", "x", 100), textRow(2, "b", "y", 100), textRow(3, "c", "z", 100)},
+		"message": {textRow(1, "1", "x", 100), textRow(2, "2", "y", 100), textRow(3, "3", "z", 100)},
 	}}
 	w := newFakeWriter()
 	r, dlq, cp := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 2, DocsPerSec: 0}, src, w)
@@ -152,7 +162,7 @@ func TestRunner_HappyPath(t *testing.T) {
 // TestRunner_Idempotent 同一 message_id 重复行 → ES 去重，doc 数不增（`_id` 幂等）。
 func TestRunner_Idempotent(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
-		"message": {textRow(1, "dup", "v1", 100), textRow(2, "dup", "v2", 100), textRow(3, "uniq", "w", 100)},
+		"message": {textRow(1, "5000", "v1", 100), textRow(2, "5000", "v2", 100), textRow(3, "5001", "w", 100)},
 	}}
 	w := newFakeWriter()
 	r, _, _ := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 10}, src, w)
@@ -168,8 +178,8 @@ func TestRunner_Idempotent(t *testing.T) {
 func TestRunner_RawExcludedStillIndexed(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
 		"message": {
-			{ID: 1, MessageID: "sig", Signal: 1, Payload: []byte("ENC"), CreatedUnix: 100},
-			textRow(2, "txt", "hi", 100),
+			{ID: 1, MessageID: "9001", Signal: 1, Payload: []byte("ENC"), CreatedUnix: 100},
+			textRow(2, "9002", "hi", 100),
 		},
 	}}
 	w := newFakeWriter()
@@ -190,7 +200,7 @@ func TestRunner_RawExcludedStillIndexed(t *testing.T) {
 func TestRunner_RealAnomalyToDLQ(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
 		"message": {
-			textRow(1, "ok", "hi", 100),
+			textRow(1, "9101", "hi", 100),
 			{ID: 2, MessageID: "bad", Payload: []byte("{not json"), CreatedUnix: 100},
 		},
 	}}
@@ -215,10 +225,10 @@ func TestRunner_RealAnomalyToDLQ(t *testing.T) {
 // TestRunner_PermanentESRejectToDLQ ES 永久拒绝(4xx) → 落 DLQ spill，不卡批。
 func TestRunner_PermanentESRejectToDLQ(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
-		"message": {textRow(1, "ok", "hi", 100), textRow(2, "poison", "boom", 100)},
+		"message": {textRow(1, "9101", "hi", 100), textRow(2, "9202", "boom", 100)},
 	}}
 	w := newFakeWriter()
-	w.permanent["poison"] = struct{}{}
+	w.permanent["9202"] = struct{}{}
 	r, dlq, _ := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 10}, src, w)
 	stats, err := r.Run(context.Background())
 	if err != nil {
@@ -235,10 +245,10 @@ func TestRunner_PermanentESRejectToDLQ(t *testing.T) {
 // TestRunner_PermanentRejectRecordKeepsSourcePKAndPayload 🔴 P2-1：永久拒绝的 DLQ 记录须保留
 // 源 PK（table/id）+ 原始 payload，便于排查 / 回灌。
 func TestRunner_PermanentRejectRecordKeepsSourcePKAndPayload(t *testing.T) {
-	poison := textRow(42, "poison", "boom-body", 100)
+	poison := textRow(42, "9242", "boom-body", 100)
 	src := &fakeSource{rows: map[string][]*srcMessageRow{"message": {poison}}}
 	w := newFakeWriter()
-	w.permanent["poison"] = struct{}{}
+	w.permanent["9242"] = struct{}{}
 	r, dlq, _ := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 10}, src, w)
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -248,7 +258,7 @@ func TestRunner_PermanentRejectRecordKeepsSourcePKAndPayload(t *testing.T) {
 		t.Fatalf("want 1 dlq record, got %d", len(recs))
 	}
 	rec := recs[0]
-	if rec.Table != "message" || rec.ID != 42 || rec.MessageID != "poison" {
+	if rec.Table != "message" || rec.ID != 42 || rec.MessageID != "9242" {
 		t.Fatalf("permanent-reject record must keep source PK: %+v", rec)
 	}
 	if string(rec.Payload) != string(poison.Payload) {
@@ -281,10 +291,10 @@ func TestRunner_EmptyMessageIDNoDedupCollapse(t *testing.T) {
 }
 func TestRunner_TransientRetriesInPlace(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
-		"message": {textRow(1, "a", "x", 100), textRow(2, "slow", "y", 100), textRow(3, "c", "z", 100)},
+		"message": {textRow(1, "1", "x", 100), textRow(2, "7", "y", 100), textRow(3, "3", "z", 100)},
 	}}
 	w := newFakeWriter()
-	w.transient["slow"] = 2 // 头两次 429，第三次 OK
+	w.transient["7"] = 2 // 头两次 429，第三次 OK
 	r, dlq, _ := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 10, TransientBackoff: time.Millisecond}, src, w)
 	stats, err := r.Run(context.Background())
 	if err != nil {
@@ -304,7 +314,7 @@ func TestRunner_TransientRetriesInPlace(t *testing.T) {
 // TestRunner_BatchLevelTransientRetried 批级错误（网络）→ 整批退避重试（幂等去重），最终成功。
 func TestRunner_BatchLevelTransientRetried(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
-		"message": {textRow(1, "a", "x", 100), textRow(2, "b", "y", 100)},
+		"message": {textRow(1, "1", "x", 100), textRow(2, "2", "y", 100)},
 	}}
 	w := newFakeWriter()
 	w.bulkErr = errors.New("connection refused") // 第一次批级失败，自愈
@@ -322,7 +332,7 @@ func TestRunner_BatchLevelTransientRetried(t *testing.T) {
 func TestRunner_Resume(t *testing.T) {
 	dir := t.TempDir()
 	cpPath := filepath.Join(dir, "cp.json")
-	rows := []*srcMessageRow{textRow(1, "a", "x", 100), textRow(2, "b", "y", 100), textRow(3, "c", "z", 100)}
+	rows := []*srcMessageRow{textRow(1, "1", "x", 100), textRow(2, "2", "y", 100), textRow(3, "3", "z", 100)}
 	src := &fakeSource{rows: map[string][]*srcMessageRow{"message": rows}}
 
 	// 第一次：只跑前 2 行（用预置 checkpoint 模拟「上次跑到 id=2」）。
@@ -363,8 +373,8 @@ func TestRunner_Resume(t *testing.T) {
 // TestRunner_MultiTable 多分表各自 keyset 推进，汇总统计正确。
 func TestRunner_MultiTable(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
-		"message":  {textRow(1, "a", "x", 100)},
-		"message1": {textRow(1, "b", "y", 100), textRow(2, "c", "z", 100)},
+		"message":  {textRow(1, "1", "x", 100)},
+		"message1": {textRow(1, "2", "y", 100), textRow(2, "3", "z", 100)},
 	}}
 	w := newFakeWriter()
 	r, _, cp := newTestRunner(t, Config{Tables: []string{"message", "message1"}, BatchSize: 10}, src, w)
@@ -392,7 +402,7 @@ func TestRunner_ReadErrorStops(t *testing.T) {
 
 // TestRunner_EnsureIndexErrorStops EnsureIndex 失败 → 不读不写，直接 STOP。
 func TestRunner_EnsureIndexErrorStops(t *testing.T) {
-	src := &fakeSource{rows: map[string][]*srcMessageRow{"message": {textRow(1, "a", "x", 100)}}}
+	src := &fakeSource{rows: map[string][]*srcMessageRow{"message": {textRow(1, "1", "x", 100)}}}
 	w := newFakeWriter()
 	w.ensureErr = errors.New("es down")
 	r, _, _ := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 10}, src, w)
@@ -408,7 +418,7 @@ func TestRunner_EnsureIndexErrorStops(t *testing.T) {
 func TestRunner_CtxCancelStops(t *testing.T) {
 	rows := make([]*srcMessageRow, 0, 100)
 	for i := int64(1); i <= 100; i++ {
-		rows = append(rows, textRow(i, fmt.Sprintf("m%d", i), "x", 100))
+		rows = append(rows, textRow(i, fmt.Sprintf("%d", i), "x", 100))
 	}
 	src := &fakeSource{rows: map[string][]*srcMessageRow{"message": rows}}
 	w := newFakeWriter()
@@ -488,7 +498,7 @@ func TestRunner_ResumeAfterDLQNoDoubleCount(t *testing.T) {
 	dir := t.TempDir()
 	spillDir := filepath.Join(dir, "dlq")
 	rows := []*srcMessageRow{
-		textRow(1, "ok", "hi", 100),
+		textRow(1, "9101", "hi", 100),
 		{ID: 2, MessageID: "bad", Payload: []byte("{not json"), CreatedUnix: 100},
 	}
 	src := &fakeSource{rows: map[string][]*srcMessageRow{"message": rows}}

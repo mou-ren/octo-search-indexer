@@ -61,6 +61,7 @@ const (
 type srcMessageRow struct {
 	ID          int64
 	MessageID   string
+	MessageSeq  int64 // 消息序列号（严格递增）— reader channel_offset「清空会话」gate 用
 	FromUID     string
 	ChannelID   string
 	ChannelType uint8
