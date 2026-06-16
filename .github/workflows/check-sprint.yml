@@ -33,7 +33,14 @@ name: Check Sprint
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    # Include "edited" so the check re-runs when the PR description is updated
+    # (e.g. a developer adds "Closes #<issue>" after opening) — the reusable
+    # workflow resolves Sprint from the linked issue, so a body edit must
+    # re-trigger it. "ready_for_review"/"converted_to_draft" keep the draft-skip
+    # safe (without them a green "skipped" result cached on the draft SHA would
+    # persist after promotion and bypass the Sprint gate). Matches the usage
+    # documented in reusable-check-sprint.yml.
+    types: [opened, synchronize, reopened, edited, ready_for_review, converted_to_draft]
     branches: [main]
 
 permissions: {}
