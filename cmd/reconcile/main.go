@@ -5,22 +5,32 @@
 //
 //	reconcile -from 1709078400 -to 1718323200 \
 //	  -mysql-dsn 'user:pass@tcp(host:3306)/im_prod' -tables message,message1,message2,message3,message4 \
-//	  -es http://localhost:9200 -es-index octo-message [-dlq N]
+//	  -es http://localhost:9200 -es-index octo-message [-dlq N] [-dlq-spill-dir DIR]
 //
 // 与 indexer 写入器解耦（沿用 internal/esindex 解耦纪律）：本命令只读 MySQL + 查 ES，不依赖
 // consumer。阶段 6 backfill job 可直接 import internal/recon 复用对账算术。
+//
+// DLQ 行处理：count 对账用 -dlq 抵消窗内已知 DLQ 数；字段级抽样门用 -dlq-spill-dir 读 backfill
+// 落下的 DLQ spill 文件，把这些行（本就不该有 ES doc）从抽样比对排除——与 inline backfill 对账门
+// （cmd/backfill 用 in-memory DLQSpill.MessageIDsInWindow）口径一致，避免抽样命中合法 DLQ 行时
+// 误报 sample_missing → 误 exit 2 阻塞 alias 切换。
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-search-indexer/internal/backfill"
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/recon"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/opensearch-project/opensearch-go/v3"
@@ -46,6 +56,12 @@ func run() error {
 		esUser   = flag.String("es-user", os.Getenv("RECON_ES_USER"), "OpenSearch username")
 		esPass   = flag.String("es-pass", os.Getenv("RECON_ES_PASS"), "OpenSearch password")
 		dlq      = flag.Int64("dlq", 0, "known DLQ count in window (rows that never reached ES body index)")
+		dlqDir   = flag.String("dlq-spill-dir", os.Getenv("RECON_DLQ_SPILL_DIR"), "optional backfill DLQ spill dir (or RECON_DLQ_SPILL_DIR); its message_ids are excluded from the field-level sample gate so legit DLQ rows don't false-fail as sample_missing")
+		sampleN  = flag.Int("sample", envInt("RECON_SAMPLE", 200), "field-level sample size (0 disables sampling)")
+		maxDet   = flag.Int("sample-max-details", envInt("RECON_SAMPLE_MAX_DETAILS", 50), "cap on mismatch detail entries in the report")
+		jsonOut  = flag.Bool("json", false, "emit the structured FullReport as JSON")
+		pushURL  = flag.String("push-url", os.Getenv("RECON_PUSH_URL"), "optional octo-server ingestion URL to POST the search_recon gauge payload")
+		pushTok  = flag.String("push-token", os.Getenv("RECON_PUSH_TOKEN"), "optional bearer token for -push-url")
 		timeout  = flag.Duration("timeout", 60*time.Second, "overall timeout")
 	)
 	flag.Parse()
@@ -114,12 +130,91 @@ func run() error {
 		// 输入不自洽（DLQ accounting 加固，阶段 6 (f)）：拒绝在可疑计数上判 OK。
 		return err
 	}
-	fmt.Println(report.String())
-	if !report.OK {
-		// 不对平：退出码 2，作为 backfill/CI gate 的失败信号。
+
+	full := recon.FullReport{Count: report, RanAtUnixSeconds: time.Now().Unix()}
+	full.Window.FromUnix = *fromUnix
+	full.Window.ToUnix = to
+
+	// 抽样字段比对（步骤 5 核心：count 对账不证内容一致）。
+	if *sampleN > 0 {
+		sampleReader := recon.NewMySQLSampleReader(db, splitCSV(*tablesS))
+		docFetcher := recon.NewOSDocFetcher(osClient, *esIndex)
+		// 排除 backfill 已落 DLQ spill 的真异常 / 永久拒绝行：它们本就不该在 ES 正文索引里
+		// （count 门已用同一 DLQ 计数抵消），抽样命中时不能再算成 missing（口径冲突 → false MISMATCH）。
+		// 与 inline backfill 对账门（cmd/backfill）行为一致：那条路用 in-memory DLQSpill.MessageIDsInWindow，
+		// 这条 standalone 路无 live spill，故从 backfill job 留下的 spill 文件只读复原同一份排除集。
+		excluded, lerr := backfill.LoadDLQMessageIDsInWindow(*dlqDir, *fromUnix, to)
+		if lerr != nil {
+			return fmt.Errorf("load DLQ spill exclusion set: %w", lerr)
+		}
+		sample, serr := recon.CompareSamplesExcluding(ctx, sampleReader, docFetcher, *fromUnix, to, *sampleN, *maxDet, excluded)
+		if serr != nil {
+			return serr
+		}
+		full.Sample = sample
+	}
+
+	// 回填 octo-server 只读 search_recon_* gauge（可选）。push 失败不改变对账结论，但要显式告警。
+	if *pushURL != "" {
+		if perr := pushReport(ctx, *pushURL, *pushTok, full.PushPayload()); perr != nil {
+			log.Printf("warn: push recon payload to %s failed: %v", *pushURL, perr)
+		}
+	}
+
+	if *jsonOut {
+		b, jerr := json.MarshalIndent(full, "", "  ")
+		if jerr != nil {
+			return fmt.Errorf("marshal report: %w", jerr)
+		}
+		fmt.Println(string(b))
+	} else {
+		fmt.Println(full.String())
+	}
+
+	if !full.Healthy() {
+		// 不对平（count 或抽样 drift）：退出码 2，作为 backfill/CI/cron gate 的失败信号。
 		os.Exit(2)
 	}
 	return nil
+}
+
+// pushReport POST 结构化 gauge 载荷到 octo-server 只读 ingestion 端（载荷逐字段对齐
+// recon_metrics.go::ReconReport）。仅在 -push-url 配置时调用。
+func pushReport(ctx context.Context, url, token string, payload recon.PushPayload) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal push payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("reconcile: close push response body: %v", cerr)
+		}
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("push returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func envOr(k, def string) string {

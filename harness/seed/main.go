@@ -75,15 +75,15 @@ func suite(base int64) []kafka.Message {
 		})
 	}
 	// 正常英文 + 中文（验证 IK 分词召回）。
-	out = append(out, text("m-en-1", "hello world search pipeline"))
-	out = append(out, text("m-zh-1", "今天天气很好我们去公园散步吧"))
-	out = append(out, text("m-zh-2", "搜索引擎中文分词测试：北京欢迎你"))
+	out = append(out, text("1000000000000000001", "hello world search pipeline"))
+	out = append(out, text("1000000000000000002", "今天天气很好我们去公园散步吧"))
+	out = append(out, text("1000000000000000003", "搜索引擎中文分词测试：北京欢迎你"))
 	// 重复 message_id（幂等：写两次，ES 只应有一条 doc）。
-	out = append(out, text("m-dup", "first copy"))
-	out = append(out, text("m-dup", "second copy overwrites same _id"))
+	out = append(out, text("1000000000000000004", "first copy"))
+	out = append(out, text("1000000000000000004", "second copy overwrites same _id"))
 	// raw_excluded（Signal 加密 / 非文本）：content=null，仍写入 ES 占一个 doc。
 	out = append(out, contractMsg(searchmsg.Message{
-		SchemaVersion: searchmsg.SchemaVersion, MessageID: "m-signal", ChannelID: "u1@u2", ChannelType: 1,
+		SchemaVersion: searchmsg.SchemaVersion, MessageID: "1000000000000000005", ChannelID: "u1@u2", ChannelType: 1,
 		FromUID: "u1", Content: nil, RawExcluded: true, MsgTimestamp: base, CreatedAt: base,
 		Source: searchmsg.SourceETLMessageTable,
 	}))
@@ -102,7 +102,7 @@ func bulk(n int, base int64) []kafka.Message {
 		c := fmt.Sprintf("消息正文 message body number %d 测试中文分词与吞吐", i)
 		out = append(out, contractMsg(searchmsg.Message{
 			SchemaVersion: searchmsg.SchemaVersion,
-			MessageID:     fmt.Sprintf("bulk-%08d", i),
+			MessageID:     fmt.Sprintf("%d", int64(2000000000000000000)+int64(i)),
 			ChannelID:     "g_bulk", ChannelType: 2, FromUID: "u_bulk",
 			Content: &c, ContentType: 1, MsgTimestamp: base, CreatedAt: base + int64(i%3600),
 			Source: searchmsg.SourceETLMessageTable,

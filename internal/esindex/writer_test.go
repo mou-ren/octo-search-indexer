@@ -79,12 +79,12 @@ func TestBulk_AllSuccess(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		gotBody = readAll(r.Body)
 		return jsonResp(200, `{"took":1,"errors":false,"items":[
-			{"index":{"_id":"m1","status":201}},
-			{"index":{"_id":"m2","status":200}}
+			{"index":{"_id":"101","status":201}},
+			{"index":{"_id":"102","status":200}}
 		]}`), nil
 	})
 	w := newTestWriter(t, rt)
-	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("m1", "hi"), msg("m2", "世界")})
+	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("101", "hi"), msg("102", "世界")})
 	if err != nil {
 		t.Fatalf("Bulk: %v", err)
 	}
@@ -92,12 +92,15 @@ func TestBulk_AllSuccess(t *testing.T) {
 		t.Fatalf("expected both OK, got %+v", res)
 	}
 	// 校验 NDJSON 动作行带 _id（upsert 幂等键 = message_id）。
-	if !strings.Contains(gotBody, `"_id":"m1"`) || !strings.Contains(gotBody, `"_id":"m2"`) {
+	if !strings.Contains(gotBody, `"_id":"101"`) || !strings.Contains(gotBody, `"_id":"102"`) {
 		t.Fatalf("bulk body missing _id action lines: %s", gotBody)
 	}
-	// 校验文档行含中文正文（可被 mapping analyzer 分词）。
-	if !strings.Contains(gotBody, "世界") {
-		t.Fatalf("bulk body missing chinese content: %s", gotBody)
+	// 校验文档行：正文嵌套在 payload.text.content（reader 契约），messageId 为数值 long。
+	if !strings.Contains(gotBody, `"payload"`) || !strings.Contains(gotBody, "世界") {
+		t.Fatalf("bulk body missing nested payload content: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"messageId":101`) {
+		t.Fatalf("bulk body must carry numeric messageId (reader long): %s", gotBody)
 	}
 }
 
@@ -105,15 +108,15 @@ func TestBulk_AllSuccess(t *testing.T) {
 func TestBulk_MixedStatuses(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"took":1,"errors":true,"items":[
-			{"index":{"_id":"ok","status":201}},
-			{"index":{"_id":"bad","status":400,"error":{"type":"mapper_parsing_exception","reason":"bad field"}}},
-			{"index":{"_id":"throttle","status":429,"error":{"type":"es_rejected","reason":"queue full"}}},
-			{"index":{"_id":"srv","status":503,"error":{"type":"unavailable","reason":"node down"}}}
+			{"index":{"_id":"201","status":201}},
+			{"index":{"_id":"400","status":400,"error":{"type":"mapper_parsing_exception","reason":"bad field"}}},
+			{"index":{"_id":"429","status":429,"error":{"type":"es_rejected","reason":"queue full"}}},
+			{"index":{"_id":"503","status":503,"error":{"type":"unavailable","reason":"node down"}}}
 		]}`), nil
 	})
 	w := newTestWriter(t, rt)
 	res, err := w.Bulk(context.Background(), []searchmsg.Message{
-		msg("ok", "a"), msg("bad", "b"), msg("throttle", "c"), msg("srv", "d"),
+		msg("201", "a"), msg("400", "b"), msg("429", "c"), msg("503", "d"),
 	})
 	if err != nil {
 		t.Fatalf("Bulk: %v", err)
@@ -138,7 +141,7 @@ func TestBulk_BatchFailure(t *testing.T) {
 		return nil, io.ErrUnexpectedEOF
 	})
 	w := newTestWriter(t, rt)
-	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("m1", "x")})
+	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("301", "x")})
 	if err == nil {
 		t.Fatalf("expected batch-level error")
 	}
@@ -170,11 +173,11 @@ func TestBulk_Idempotent(t *testing.T) {
 	var bodies []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		bodies = append(bodies, readAll(r.Body))
-		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"dup","status":201}}]}`), nil
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"555","status":201}}]}`), nil
 	})
 	w := newTestWriter(t, rt)
 	for i := 0; i < 2; i++ {
-		if _, err := w.Bulk(context.Background(), []searchmsg.Message{msg("dup", "v")}); err != nil {
+		if _, err := w.Bulk(context.Background(), []searchmsg.Message{msg("555", "v")}); err != nil {
 			t.Fatalf("Bulk #%d: %v", i, err)
 		}
 	}
@@ -184,8 +187,8 @@ func TestBulk_Idempotent(t *testing.T) {
 		if err := json.Unmarshal([]byte(first), &action); err != nil {
 			t.Fatalf("parse action line: %v", err)
 		}
-		if action.Index.ID != "dup" {
-			t.Fatalf("idempotent key must be message_id 'dup', got %q", action.Index.ID)
+		if action.Index.ID != "555" {
+			t.Fatalf("idempotent key must be normalized messageId '555', got %q", action.Index.ID)
 		}
 	}
 }
@@ -193,10 +196,10 @@ func TestBulk_Idempotent(t *testing.T) {
 // TestBulk_MissingResponseItem 响应条目数少于请求 → 缺失条标 transient，绝不静默当成功。
 func TestBulk_MissingResponseItem(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"m1","status":201}}]}`), nil
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"701","status":201}}]}`), nil
 	})
 	w := newTestWriter(t, rt)
-	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("m1", "a"), msg("m2", "b")})
+	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("701", "a"), msg("702", "b")})
 	if err != nil {
 		t.Fatalf("Bulk: %v", err)
 	}
@@ -268,5 +271,56 @@ func TestIndexMappingJSON_Valid(t *testing.T) {
 	}
 	if _, ok := m["mappings"]; !ok {
 		t.Fatalf("mapping JSON missing 'mappings'")
+	}
+}
+
+// TestBulk_NonNumericIDIsPermanentNoES 非数值 message_id → 该条 permanent(400)，
+// 且仍把同批可转条目正常写 ES（混批不被毒丸拖垮）。
+func TestBulk_NonNumericIDIsPermanentNoES(t *testing.T) {
+	var sentBody string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		sentBody = readAll(r.Body)
+		// ES 只应收到 1 条（合法的 808）。
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"808","status":201}}]}`), nil
+	})
+	w := newTestWriter(t, rt)
+	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("oops", "x"), msg("808", "y")})
+	if err != nil {
+		t.Fatalf("Bulk: %v", err)
+	}
+	if res[0].OK || !res[0].Permanent() || res[0].Status != 400 {
+		t.Fatalf("non-numeric id must be permanent(400), got %+v", res[0])
+	}
+	if !res[1].OK {
+		t.Fatalf("valid sibling must still index, got %+v", res[1])
+	}
+	// 毒丸不得出现在发往 ES 的 NDJSON 里。
+	if strings.Contains(sentBody, "oops") {
+		t.Fatalf("non-numeric id must NOT be sent to ES: %s", sentBody)
+	}
+	if !strings.Contains(sentBody, `"_id":"808"`) {
+		t.Fatalf("valid doc must be sent with normalized _id: %s", sentBody)
+	}
+}
+
+// TestBulk_AllNonNumericNoESCall 整批都非数值 → 不发任何 ES 请求，全 permanent。
+func TestBulk_AllNonNumericNoESCall(t *testing.T) {
+	called := false
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return jsonResp(200, `{}`), nil
+	})
+	w := newTestWriter(t, rt)
+	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("a", "x"), msg("b", "y")})
+	if err != nil {
+		t.Fatalf("Bulk: %v", err)
+	}
+	if called {
+		t.Fatalf("no convertible docs must mean no ES call")
+	}
+	for i := range res {
+		if res[i].OK || !res[i].Permanent() {
+			t.Fatalf("all non-numeric must be permanent: %+v", res[i])
+		}
 	}
 }

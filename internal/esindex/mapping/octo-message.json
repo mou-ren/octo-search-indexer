@@ -8,21 +8,92 @@
   "mappings": {
     "dynamic": "strict",
     "properties": {
-      "schema_version": { "type": "integer" },
-      "message_id":     { "type": "keyword" },
-      "channel_id":     { "type": "keyword" },
-      "channel_type":   { "type": "integer" },
-      "from_uid":       { "type": "keyword" },
-      "content": {
-        "type": "text",
-        "analyzer": "ik_max_word",
-        "search_analyzer": "ik_smart"
-      },
-      "content_type":   { "type": "integer" },
-      "raw_excluded":   { "type": "boolean" },
-      "msg_timestamp":  { "type": "long" },
-      "created_at":     { "type": "long" },
-      "source":         { "type": "keyword" }
+      "schemaVersion": { "type": "integer" },
+      "messageId":     { "type": "long" },
+      "messageSeq":    { "type": "long" },
+      "from":          { "type": "keyword", "ignore_above": 256 },
+      "to":            { "type": "keyword", "ignore_above": 256 },
+      "channelId":     { "type": "keyword", "ignore_above": 256 },
+      "channelType":   { "type": "integer" },
+      "spaceId":       { "type": "keyword", "ignore_above": 256 },
+      "visibles":      { "type": "keyword", "ignore_above": 256 },
+      "timestamp":     { "type": "date", "format": "epoch_second" },
+      "createdAt":     { "type": "long" },
+      "revoked":       { "type": "boolean" },
+      "rawExcluded":   { "type": "boolean" },
+      "source":        { "type": "keyword", "ignore_above": 64 },
+      "payload": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "integer" },
+          "text": {
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "text",
+                "analyzer": "ik_max_word",
+                "search_analyzer": "ik_smart"
+              }
+            }
+          },
+          "image": {
+            "type": "object",
+            "properties": {
+              "url":     { "type": "keyword", "ignore_above": 1024 },
+              "caption": { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+              "name":    { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+              "width":   { "type": "integer" },
+              "height":  { "type": "integer" }
+            }
+          },
+          "gif": {
+            "type": "object",
+            "properties": {
+              "url": { "type": "keyword", "ignore_above": 1024 }
+            }
+          },
+          "voice": {
+            "type": "object",
+            "properties": {
+              "url": { "type": "keyword", "ignore_above": 1024 }
+            }
+          },
+          "video": {
+            "type": "object",
+            "properties": {
+              "url":    { "type": "keyword", "ignore_above": 1024 },
+              "cover":  { "type": "keyword", "ignore_above": 1024 },
+              "width":  { "type": "integer" },
+              "height": { "type": "integer" },
+              "second": { "type": "integer" }
+            }
+          },
+          "file": {
+            "type": "object",
+            "properties": {
+              "url":       { "type": "keyword", "ignore_above": 1024 },
+              "name":      { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+              "caption":   { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+              "size":      { "type": "long" },
+              "extension": { "type": "keyword", "ignore_above": 32 }
+            }
+          },
+          "mergeForward": {
+            "type": "object",
+            "properties": {
+              "childCount": { "type": "integer" },
+              "msgs": {
+                "type": "object",
+                "properties": {
+                  "messageId":  { "type": "long" },
+                  "type":       { "type": "integer" },
+                  "searchText": { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

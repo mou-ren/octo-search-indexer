@@ -89,6 +89,38 @@ independent binary/image distinct from `octo-server`.
 > + 中文 analyzer bootstrap. `/metrics` and lag/backlog instrumentation land in
 > phase 7.
 
+## Backfill & reconciliation (must-run gate)
+
+The phase-6 backfill job (`cmd/backfill`) loads existing `message` shards into
+OpenSearch, bypassing Kafka, and is the **only** path that fills the reader's
+safety fields (`spaceId`/`visibles`/`messageSeq`) from the raw MySQL payload.
+
+A count match alone does not prove correctness — it proves only that the row
+*counts* tie, not that each doc's authz/correctness fields are right. **Always run
+the field-level reconciliation gate after a backfill:**
+
+```sh
+# inline after the backfill run (uses the job's own exact DLQ count as authority):
+go run ./cmd/backfill ... -reconcile -from <epoch> -to <epoch>   # count gate + field-level sample gate
+
+# or standalone, any time (pass the backfill DLQ spill dir so legit DLQ rows are
+# excluded from the sample gate exactly like the inline path — otherwise a sampled
+# DLQ row false-fails as sample_missing and the gate exits non-zero):
+make run-recon RECON_FROM=<epoch> RECON_TO=<epoch> RECON_DLQ=<dlq-count> \
+  RECON_DLQ_SPILL_DIR=<the backfill -spill-dir>
+```
+
+The sample gate cross-checks `messageId` (full precision), `channelId`,
+`channelType`, `spaceId`, and **`visibles`** between MySQL and the ES doc, so a
+silently dropped ACL (`visibles`) field surfaces as `sample_mismatch>0` and the
+gate exits non-zero. Rows the backfill deliberately routed to the DLQ (bad
+payload / non-numeric id / permanent ES reject — already counted in `-dlq`) are
+*expected* to have no ES doc; both reconcile paths exclude them from the sample
+gate (inline reads its in-memory spill, standalone reads the same spill dir via
+`-dlq-spill-dir` / `RECON_DLQ_SPILL_DIR`) so they never false-fail as
+`sample_missing`. `make run-recon` is **mandatory** before switching the read
+alias to a freshly backfilled index (see `docs/forward-migration-v1.9.md`).
+
 ## Build
 
 ```sh

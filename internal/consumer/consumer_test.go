@@ -93,6 +93,11 @@ func (w *fakeWriter) Close() error { return nil }
 
 func (w *fakeWriter) EnsureIndex(ctx context.Context) error { return nil }
 
+// BulkDocs 不被 consumer 路径调用（consumer 走 Bulk(msgs)）；提供空实现满足接口。
+func (w *fakeWriter) BulkDocs(ctx context.Context, docs []esindex.Doc) ([]esindex.BulkItemResult, error) {
+	return nil, nil
+}
+
 // fakeDLQSink 记录 DLQ 投递；可设定前 N 次失败。
 type fakeDLQSink struct {
 	writes     int
