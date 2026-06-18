@@ -67,9 +67,10 @@ spec:
             # topic 由 topic-init Job 显式建 (1 分区 1 副本); 关自动建 topic 防 typo 静默建错。
             - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
               value: "false"
-            # KRaft 数据目录 = 挂载的 PVC。
+            # KRaft 数据目录 = 挂载的 PVC 下子目录 (避开 cbs 块存储的 lost+found,
+            #   Kafka 拒绝 log dir 根含非 topic 目录 → 必须用子目录)。
             - name: KAFKA_LOG_DIRS
-              value: "/var/lib/kafka/data"
+              value: "/var/lib/kafka/data/kraft"
           resources:
             # PlanBot §5: Kafka ~250m/512Mi。
             requests:
