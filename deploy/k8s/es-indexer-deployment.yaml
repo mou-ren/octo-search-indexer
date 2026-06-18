@@ -30,6 +30,8 @@ spec:
       labels:
         app: es-indexer
     spec:
+      imagePullSecrets:
+        - name: tcr-image-xtiao   # 私有 TCR 拉 es-indexer 镜像需认证 (与 octo-server 同 secret)
       containers:
         - name: es-indexer
           image: octo-search-indexer:d2c7cc3   # 经 kustomize images: 重写为 TCR digest
