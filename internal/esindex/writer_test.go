@@ -324,3 +324,93 @@ func TestBulk_AllNonNumericNoESCall(t *testing.T) {
 		}
 	}
 }
+
+// TestBulkDocs_SplitsByByteSize 🔴 §4.4（codex 补）：payloadRaw 内嵌后，按字节切子批，避免单次
+// _bulk body 超 http.max_content_length 被当 transient 无限重试卡死。构造多条大 payloadRaw doc，
+// 断言 BulkDocs 拆成多次 _bulk 请求，且 per-item 结果按入参顺序齐全。
+func TestBulkDocs_SplitsByByteSize(t *testing.T) {
+	bulkCalls := 0
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := readAll(r.Body)
+		// 数请求里的动作行条数（每条一行 {"index":...}），按数生成等量成功 items。
+		n := strings.Count(body, `{"index":`)
+		bulkCalls++
+		var sb strings.Builder
+		sb.WriteString(`{"took":1,"errors":false,"items":[`)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(`{"index":{"status":201}}`)
+		}
+		sb.WriteString(`]}`)
+		return jsonResp(200, sb.String()), nil
+	})
+	w := osWriterFor(t, rt)
+
+	// 每条 doc 带 ~20MB payloadRaw → 3 条 = ~60MB > 50MB 阈值 → 至少切 2 个子批。
+	big := make([]byte, 20<<20)
+	for i := range big {
+		big[i] = 'x'
+	}
+	rawBig := mustRawObject(big)
+	docs := make([]Doc, 3)
+	for i := range docs {
+		docs[i] = Doc{MessageID: int64(1000 + i), ChannelID: "g", ChannelType: 2, PayloadRaw: rawBig}
+	}
+	res, err := w.BulkDocs(context.Background(), docs)
+	if err != nil {
+		t.Fatalf("BulkDocs: %v", err)
+	}
+	if len(res) != 3 {
+		t.Fatalf("expected 3 per-item results in input order, got %d", len(res))
+	}
+	for i := range res {
+		if !res[i].OK {
+			t.Fatalf("doc %d expected OK, got %+v", i, res[i])
+		}
+	}
+	if bulkCalls < 2 {
+		t.Fatalf("oversized total must be split into >=2 _bulk requests, got %d", bulkCalls)
+	}
+}
+
+// mustRawObject 把一段大字节塞进一个合法 JSON 对象的字段值（用于构造大 payloadRaw）。
+func mustRawObject(filler []byte) []byte {
+	// {"type":2,"blob":"<filler>"}
+	b := make([]byte, 0, len(filler)+32)
+	b = append(b, []byte(`{"type":2,"blob":"`)...)
+	b = append(b, filler...)
+	b = append(b, []byte(`"}`)...)
+	return b
+}
+
+// TestBulkDocs_SingleOversizedDocIsPermanent §4.4（codex P2 补）：单条 doc 编码自身超 _bulk 上限
+// → 不发 ES、直接判 permanent(413)，让 consumer/backfill 路由 DLQ 而非无限 transient 重试。
+func TestBulkDocs_SingleOversizedDocIsPermanent(t *testing.T) {
+	bulkCalls := 0
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		bulkCalls++
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"status":201}}]}`), nil
+	})
+	w := osWriterFor(t, rt)
+	// 一条 doc 的 payloadRaw 超过 maxBulkBodyBytes 自身。
+	huge := make([]byte, maxBulkBodyBytes+1024)
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	docs := []Doc{{MessageID: 1, ChannelID: "g", ChannelType: 2, PayloadRaw: mustRawObject(huge)}}
+	res, err := w.BulkDocs(context.Background(), docs)
+	if err != nil {
+		t.Fatalf("BulkDocs must not return a batch error for a poison doc (it's per-item permanent): %v", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(res))
+	}
+	if res[0].OK || !res[0].Permanent() {
+		t.Fatalf("oversized single doc must be permanent (DLQ-routed), got OK=%v status=%d", res[0].OK, res[0].Status)
+	}
+	if bulkCalls != 0 {
+		t.Fatalf("oversized single doc must NOT hit ES (would 413), got %d bulk calls", bulkCalls)
+	}
+}
