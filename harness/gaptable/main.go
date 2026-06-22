@@ -38,7 +38,11 @@ func main() {
 		Async:                  false,
 		AllowAutoTopicCreation: true,
 	}
-	defer func() { _ = w.Close() }()
+	defer func() {
+		if cerr := w.Close(); cerr != nil {
+			log.Printf("gaptable: writer close error: %v", cerr)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -124,7 +128,10 @@ func vectors(base int64) []kafka.Message {
 		RawExcluded: true, Content: nil,
 		Source: searchmsg.SourceETLMessageTable,
 	}
-	eb, _ := json.Marshal(encM)
+	eb, err := json.Marshal(encM)
+	if err != nil {
+		log.Fatalf("marshal %s: %v", encM.MessageID, err)
+	}
 	out = append(out, kafka.Message{Key: []byte(encM.MessageID), Value: eb})
 
 	return out

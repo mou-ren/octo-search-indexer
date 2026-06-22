@@ -59,10 +59,25 @@ PASS=0; FAIL=0
 ok(){ echo "PASS | $1"; PASS=$((PASS+1)); }
 no(){ echo "FAIL | $1"; FAIL=$((FAIL+1)); }
 
-jqid(){ python3 -c "import json,sys;r=json.load(sys.stdin);print(','.join(h['_id'] for h in r['hits']['hits']))"; }
+# jqid extracts the comma-joined hit _ids from a search response. On anything
+# that is NOT a well-formed search result (OpenSearch error body, non-JSON,
+# missing hits) it prints the sentinel __SEARCH_ERR__ instead of crashing, so
+# recall can FAIL that one assertion and the suite keeps running (under
+# `set -euo pipefail` an unhandled parse error would otherwise abort the whole
+# script and bypass the FAIL counter + final summary).
+jqid(){ python3 -c "
+import json, sys
+try:
+    r = json.load(sys.stdin)
+    print(','.join(h['_id'] for h in r['hits']['hits']))
+except Exception:
+    print('__SEARCH_ERR__')
+"; }
 
 recall(){ # label dsl want
-  local got; got=$(curl -s "$ES_URL/$ALIAS/_search" -H 'Content-Type: application/json' -d "$2" | jqid)
+  local got
+  got=$(curl -s "$ES_URL/$ALIAS/_search" -H 'Content-Type: application/json' -d "$2" | jqid) || got='__SEARCH_ERR__'
+  if [ "$got" = '__SEARCH_ERR__' ]; then no "$1 -> search/parse error (non-search response)"; return; fi
   if echo ",$got," | grep -q ",$3,"; then ok "$1 -> $3"; else no "$1 -> want $3 got [$got]"; fi
 }
 src(){ curl -s "$ES_URL/$NEW_INDEX/_doc/$1"; } # fetch _doc json
@@ -78,9 +93,20 @@ echo "[gaptable] === bring up throwaway Kafka + OpenSearch(IK) ==="
 ( cd "$HERE" && docker compose up -d --build )
 for _ in $(seq 1 60); do curl -fs "$ES_URL/_cluster/health" >/dev/null 2>&1 && break; sleep 3; done
 curl -fs "$ES_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null
-for _ in $(seq 1 60); do docker exec octo-harness-kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 && break; sleep 3; done
+# Kafka readiness must be FATAL, not best-effort: if the broker never comes up,
+# topic creation below silently no-ops and the DLQ topic is missing. The DLQ
+# writer has auto-create disabled, so the 3 poison records would spill to disk
+# instead of landing in octo.message.v1.dlq → the run false-fails on the DLQ
+# count. Fail loud here instead.
+KAFKA_READY=0
+for _ in $(seq 1 60); do docker exec octo-harness-kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 && { KAFKA_READY=1; break; }; sleep 3; done
+[ "$KAFKA_READY" = "1" ] || { echo "[gaptable] FATAL: Kafka broker not ready after timeout"; exit 1; }
+# Pre-create both topics deterministically. Don't swallow real failures — a
+# missing DLQ topic invalidates the whole STEP4 fail-closed assertion (records
+# would spill instead of being counted). --if-not-exists keeps reruns idempotent.
 for t in octo.message.v1 octo.message.v1.dlq; do
-  docker exec octo-harness-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic "$t" --partitions 1 --replication-factor 1 >/dev/null 2>&1 || true
+  docker exec octo-harness-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic "$t" --partitions 1 --replication-factor 1 >/dev/null 2>&1 \
+    || { echo "[gaptable] FATAL: failed to create Kafka topic $t"; exit 1; }
 done
 [ "${KEEP_UP:-0}" = "1" ] || trap down EXIT
 
@@ -113,7 +139,16 @@ echo "$A" | grep -q "$NEW_INDEX" && ok "STEP1 read alias -> $NEW_INDEX" || no "S
 echo "[gaptable] === STEP 2: start es-indexer (mapping-compat passes) ==="
 nohup env ES_INDEXER_ENABLED=true KAFKA_BROKERS="$KAFKA_EXTERNAL" KAFKA_TOPIC=octo.message.v1 KAFKA_DLQ_TOPIC=octo.message.v1.dlq KAFKA_GROUP_ID=octo-gaptable-e2e ES_ADDRESSES="$ES_URL" ES_INDEX="$NEW_INDEX" INDEXER_DLQ_SPILL_DIR=/tmp/octo-e2e-spill "$ES_INDEXER_BIN" >"$INDEXER_LOG" 2>&1 &
 echo $! > "$INDEXER_PID_FILE"
-sleep 12
+# Poll for readiness instead of a fixed sleep — a fixed wait is both slower than
+# needed on a fast host and flaky on a slow Docker host/CI. Bail early if the
+# process dies so we surface the startup failure instead of waiting the full window.
+INDEXER_PID="$(cat "$INDEXER_PID_FILE")"
+for _ in $(seq 1 60); do
+  grep -q 'es-indexer running' "$INDEXER_LOG" 2>/dev/null && break
+  grep -q 'exited with error' "$INDEXER_LOG" 2>/dev/null && break
+  kill -0 "$INDEXER_PID" 2>/dev/null || break
+  sleep 1
+done
 grep -q 'es-indexer running' "$INDEXER_LOG" && ! grep -q 'exited with error' "$INDEXER_LOG" \
   && ok "STEP2 es-indexer started against migrated index (startup mapping-compat + safety gate OK)" \
   || { no "STEP2 es-indexer failed to start"; cat "$INDEXER_LOG"; }
@@ -125,7 +160,34 @@ echo "[gaptable] === seed gap-table vectors ==="
 DLQ_START="$(docker exec octo-harness-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic octo.message.v1.dlq 2>/dev/null | awk -F: '{s+=$3} END{print s+0}')"
 echo "[gaptable] DLQ fence start offset = ${DLQ_START}"
 KAFKA_BROKERS="$KAFKA_EXTERNAL" KAFKA_TOPIC=octo.message.v1 "$GAPTABLE_BIN"
-sleep 8
+
+# Poll for ingestion completion instead of a fixed sleep. This run produces 13
+# vectors: 10 land in the index (G1-G7 + V1 valid + V5 broadcast + encrypted DM)
+# and 3 fail-closed into the DLQ (V2 empty / V3 null / V4 non-string visibles).
+# Wait until BOTH signals settle — every expected doc is queryable AND the DLQ
+# fence has advanced by exactly 3 — so a slow Docker host/CI no longer flakes.
+EXPECT_DOCS="3000000000000000001 3000000000000000002 3000000000000000003 3000000000000000004 3000000000000000005 3000000000000000006 3000000000000000007 3000000000000000010 3000000000000000014 3000000000000000020"
+dlq_count(){ docker exec octo-harness-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic octo.message.v1.dlq 2>/dev/null | awk -F: '{s+=$3} END{print s+0}'; }
+docs_present(){
+  local n=0 id
+  for id in $EXPECT_DOCS; do
+    [ "$(curl -s "$ES_URL/$NEW_INDEX/_doc/$id" | python3 -c "import json,sys;print(json.load(sys.stdin).get('found'))" 2>/dev/null)" = "True" ] && n=$((n+1))
+  done
+  echo "$n"
+}
+for _ in $(seq 1 40); do
+  curl -s -XPOST "$ES_URL/$NEW_INDEX/_refresh" >/dev/null 2>&1 || true
+  # `|| dlq_now=...` / `|| present=0` keep a transient docker/awk/curl failure
+  # in the poll helpers from aborting the suite under `set -euo pipefail` (a
+  # bare assignment propagates the command-substitution exit status); the loop
+  # just retries on the next tick.
+  dlq_now="$(dlq_count)" || dlq_now="$DLQ_START"
+  dlq_delta=$(( dlq_now - DLQ_START ))
+  present="$(docs_present)" || present=0
+  { [ "$present" -ge 10 ] && [ "$dlq_delta" -ge 3 ]; } && break
+  sleep 1
+done
+echo "[gaptable] ingestion settled: indexed=${present}/10 dlq_delta=${dlq_delta}"
 curl -s -XPOST "$ES_URL/$NEW_INDEX/_refresh" >/dev/null
 
 echo "[gaptable] === STEP 3: gap-table reader-DSL recall ==="
@@ -150,8 +212,11 @@ src 3000000000000000001 | python3 -c "import json,sys;pr=json.load(sys.stdin)['_
 echo "[gaptable] === STEP 4: P0 visibility fail-closed security ==="
 src 3000000000000000010 | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if d['found'] and d['_source']['visibles']==['u_admin1','u_admin2'] else 1)" && ok "valid visibles indexed+populated" || no "valid visibles"
 for id in 3000000000000000011 3000000000000000012 3000000000000000013; do
-  f=$(src "$id" | python3 -c "import json,sys;print(json.load(sys.stdin).get('found'))")
-  [ "$f" = "False" ] && ok "fail-closed $id absent from index (not fail-OPEN)" || no "fail-closed $id still indexed"
+  # `|| f=__SRC_ERR__` keeps a curl/non-JSON failure from aborting the whole
+  # suite under `set -euo pipefail` (bare assignments propagate the RHS exit
+  # status) — the assertion FAILs and the summary still prints.
+  f=$(src "$id" | python3 -c "import json,sys;print(json.load(sys.stdin).get('found'))" 2>/dev/null) || f=__SRC_ERR__
+  [ "$f" = "False" ] && ok "fail-closed $id absent from index (not fail-OPEN)" || no "fail-closed $id still indexed (found=$f)"
 done
 src 3000000000000000014 | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if d['found'] and not d['_source'].get('visibles') else 1)" && ok "broadcast (no visibles key) allowed, no gate" || no "broadcast allowed"
 src 3000000000000000020 | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('_source',{});sys.exit(0 if d['found'] and s.get('rawExcluded') and not s.get('payload') and not s.get('visibles') else 1)" && ok "encrypted DM parity (rawExcluded, no payload, empty visibles)" || no "encrypted DM parity"
