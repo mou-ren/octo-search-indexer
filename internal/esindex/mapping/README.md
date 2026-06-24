@@ -1,8 +1,43 @@
-# octo-message index mapping (v1.9 — reader-aligned)
+# octo-message index mapping (v1.11 — reader-aligned)
 
 `octo-message.json` is the **canonical index mapping + analyzer** the `es-indexer`
 writes against, embedded into the binary (`//go:embed`) and used by
 `esindex.EnsureIndex` to bootstrap the index idempotently when it does not yet exist.
+
+## v1.11 subSeq 排序 tiebreaker（配套 B2 虚拟子文档）
+
+reader 排序键是 `[timestamp, messageId]`，翻页靠 `search_after`（排他）。B2 虚拟子文档的
+`messageId`/`timestamp` 都 = 父值，同一父的 N 个子文档 tuple 完全相同 → 跨页边界时兄弟被静默跳过。
+
+v1.11 加一个数值 tiebreaker `subSeq` 作为**第三排序键**：
+
+- `subSeq` (integer) — (messageId, subSeq) 全局唯一 → (timestamp, messageId, subSeq) 唯一。
+
+写入规则（indexer）：
+- 普通消息 doc / 富文本父 doc：`subSeq = 0`（**显式落盘**，字段不用 omitempty，reader 不赌缺失=0）。
+- 富文本虚拟子文档：`subSeq = block序号 i + 1`（从 1 递增，父独占 0，保父子不撞）。
+
+游标变更由 **reader** 做（排序键改 `[timestamp, messageId, subSeq]`、把 subSeq 编进 cursor、
+旧 cursor 平滑降级）；indexer **不碰 cursor**，只负责把 subSeq 写对。subSeq 随 B2 那次 reindex
+一起落地，无额外 reindex。
+
+> subSeq 已纳入 `mapping_compat.go` 启动断言集（fail-closed）。
+
+## v1.10 富文本(type=14)内嵌媒体虚拟子文档（B2 方案）
+
+v1.10 在顶层新增 3 个字段，为「富文本里内嵌的图片/文件派生独立可搜子文档」配套：
+
+- `parentMessageId` (long) — 子文档指向父富文本 messageId（reader 用它回 MySQL join 判可见性/撤回）。
+- `parentPayloadType` (integer) — 父原 payload.type（=14）。
+- `virtual` (boolean) — 标记该 doc 由富文本派生（reader 在文本检索端点用 must_not 排除）。
+
+子文档 `payload.type ∈ {2,5,8}`，**复用现有** `payload.image`/`payload.file` mapping，本期不新增子字段。
+本期只派生 image(→type=2) / file(→type=8)（richText block 仅 text/image/file）。撤回/编辑联动
+**不做**（路线甲：reader 用 parentMessageId 回 MySQL join 判定）。详见
+`richtext-virtual-docs-indexer-dev.md`。
+
+> 这 3 个新字段已纳入 `mapping_compat.go` 启动断言集（`requiredMappingFieldPaths`），live mapping
+> 不符直接拒启动（沿用现有 fail-closed 风格）。
 
 ## v1.9 contract convergence (YUJ-4534 阶段 8 · 分叉 B)
 
