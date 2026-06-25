@@ -2,6 +2,7 @@ package esindex
 
 import (
 	"fmt"
+	"math"
 )
 
 // 富文本(type=14)内嵌媒体虚拟子文档（B2 方案，richtext-virtual-docs-indexer-dev.md）。
@@ -92,12 +93,29 @@ func imageFromBlock(blk map[string]any) *ImagePayload {
 		p.Name = n
 	}
 	if w, ok := extractInt(blk, "width"); ok {
-		p.Width = w
+		p.Width = clampInt32(w)
 	}
 	if h, ok := extractInt(blk, "height"); ok {
-		p.Height = h
+		p.Height = clampInt32(h)
 	}
 	return p
+}
+
+// clampInt32 把 width/height 钳进 ES `integer`（int32）可表示范围（见 #26）。
+//
+// octo-lib RichTextBlock.Width/Height 是 Go int（64 位）且 ValidateRichTextBlocks 仅校验 >0、
+// **无上限**；ES mapping octo-message.json 把 image width/height 声明为 `integer`（int32）。正常
+// 发送链路 width/height 取自浏览器 naturalWidth/naturalHeight，远小于 int32，但伪造/异常 payload
+// 可塞入超 int32 值 → 派生子文档写 _bulk 时 4xx 永久失败，而父在 disabled payloadRaw 下仍可成功
+// 索引 → 源行被判 DLQ 却留下可搜的孤儿父，破坏 ESDocs == SourceRows - DLQ 对账不变量。
+//
+// 兜底口径：超出 int32 范围（含负数，理论上 extractInt 不产负但防御）→ 置 0（omitempty 不落盘），
+// 「尺寸不可信则不写」，既保证子文档一定能进 ES，又不向 reader 注入污染排版的假尺寸。
+func clampInt32(v int) int {
+	if v < 0 || v > math.MaxInt32 {
+		return 0
+	}
+	return v
 }
 
 func intPtr(v int) *int { return &v }

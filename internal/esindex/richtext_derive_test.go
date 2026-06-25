@@ -266,6 +266,44 @@ func TestSubSeq_NormalDocSerializedExplicitly(t *testing.T) {
 	}
 }
 
+// TestRichTextDerivatives_ClampOversizeWidthHeight 🔴 #26：image block 的 width/height 超出
+// ES `integer`（int32）范围时，派生子文档必须把超限值钳为 0（omitempty 不落盘），
+// 保证子文档写 _bulk 不会因 int32 溢出 4xx 失败（那会留下可搜孤儿父 + 破坏 DLQ 对账）。
+// 正常范围的另一维保留不变。
+func TestRichTextDerivatives_ClampOversizeWidthHeight(t *testing.T) {
+	// width 超 int32（math.MaxInt32 = 2147483647），height 合法。
+	raw := richTextRaw(`[
+		{"type":"image","url":"http://x/big.png","name":"big.png","width":9999999999,"height":480}
+	]`)
+	d, err := DocFromMessage(branchAMsg("2062443880774537300", raw))
+	if err != nil {
+		t.Fatalf("DocFromMessage: %v", err)
+	}
+	if len(d.Derivatives) != 1 {
+		t.Fatalf("want 1 derivative, got %d", len(d.Derivatives))
+	}
+	img := d.Derivatives[0].Payload.Image
+	if img == nil {
+		t.Fatalf("derivative image payload nil")
+	}
+	// 超 int32 的 width 钳为 0。
+	if img.Width != 0 {
+		t.Fatalf("oversize width must clamp to 0 (int32-safe), got %d", img.Width)
+	}
+	// 合法 height 保留。
+	if img.Height != 480 {
+		t.Fatalf("valid height must be preserved, got %d", img.Height)
+	}
+	// width=0 受 omitempty 不落盘。
+	b, err := json.Marshal(d.Derivatives[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(b, []byte(`"width":`)) {
+		t.Fatalf("clamped-to-0 width must be omitted from _source, got %s", b)
+	}
+}
+
 // mkBulkResp 构造一个 _bulk 响应（每个 status 一项 index action）。
 func mkBulkResp(statuses ...int) *opensearchapi.BulkResp {
 	resp := &opensearchapi.BulkResp{}
