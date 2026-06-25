@@ -14,69 +14,111 @@ func richTextRaw(blocks string) string {
 	return `{"type":14,"plain":"x","content":` + blocks + `}`
 }
 
-// TestRichTextDerivatives_ImageAndFile 富文本含 1 图 1 文件 → 派生 2 个子文档：
-// image→type=2、file→type=8，各带 virtual=true + parentMessageId=父，_id 复合键。
-func TestRichTextDerivatives_ImageAndFile(t *testing.T) {
+// TestRichTextDerivatives_ImagesOnly_FileIgnored 富文本含 1 文本 + 2 图 + 1 file block：
+// 只派生 2 个 image 子文档（type=2）；file block 被忽略（octo-lib/octo-web 契约：file 未打开）。
+// 子文档各带 virtual=true + parentMessageId=父，_id 复合键，subSeq=block序号+1。
+func TestRichTextDerivatives_ImagesOnly_FileIgnored(t *testing.T) {
 	raw := richTextRaw(`[
 		{"type":"text","text":"前言"},
-		{"type":"image","url":"http://x/a.png","name":"a.png","caption":"图说","width":100,"height":200},
-		{"type":"file","url":"http://x/b.pdf","name":"b.pdf","size":1234,"extension":"pdf"}
+		{"type":"image","url":"http://x/a.png","name":"a.png","width":100,"height":200},
+		{"type":"file","url":"http://x/b.pdf","name":"b.pdf","size":1234,"extension":"pdf"},
+		{"type":"image","url":"http://x/c.png","name":"c.png","width":50,"height":60}
 	]`)
 	d, err := DocFromMessage(branchAMsg("2062443880774537216", raw))
 	if err != nil {
 		t.Fatalf("DocFromMessage: %v", err)
 	}
+	// file block (idx2) 不派生 → 只有 2 个 image 子文档（idx1, idx3）。
 	if len(d.Derivatives) != 2 {
-		t.Fatalf("want 2 derivatives (image+file), got %d", len(d.Derivatives))
+		t.Fatalf("want 2 derivatives (images only, file ignored), got %d", len(d.Derivatives))
 	}
 
-	img := d.Derivatives[0]
-	if img.Payload == nil || img.Payload.Type == nil || *img.Payload.Type != payloadTypeImage {
-		t.Fatalf("derivative[0] want image type=2, got %+v", img.Payload)
+	img1 := d.Derivatives[0]
+	if img1.Payload == nil || img1.Payload.Type == nil || *img1.Payload.Type != payloadTypeImage {
+		t.Fatalf("derivative[0] want image type=2, got %+v", img1.Payload)
 	}
-	if img.Payload.Image == nil || img.Payload.Image.URL != "http://x/a.png" ||
-		img.Payload.Image.Name != "a.png" || img.Payload.Image.Caption != "图说" ||
-		img.Payload.Image.Width != 100 || img.Payload.Image.Height != 200 {
-		t.Fatalf("image projection mismatch: %+v", img.Payload.Image)
+	if img1.Payload.Image == nil || img1.Payload.Image.URL != "http://x/a.png" ||
+		img1.Payload.Image.Name != "a.png" || img1.Payload.Image.Width != 100 || img1.Payload.Image.Height != 200 {
+		t.Fatalf("image1 projection mismatch: %+v", img1.Payload.Image)
 	}
-	if !img.Virtual || img.ParentMessageID != d.MessageID || img.ParentPayloadType != payloadTypeRichText {
-		t.Fatalf("image parent-tracking mismatch: virtual=%v parent=%d ptype=%d", img.Virtual, img.ParentMessageID, img.ParentPayloadType)
+	// 富文本 image 无 caption，不应被填充。
+	if img1.Payload.Image.Caption != "" {
+		t.Fatalf("richtext image must not carry caption, got %q", img1.Payload.Image.Caption)
 	}
-	if img.MessageID != d.MessageID {
-		t.Fatalf("derivative messageId must equal parent: got %d want %d", img.MessageID, d.MessageID)
+	if !img1.Virtual || img1.ParentMessageID != d.MessageID || img1.ParentPayloadType != payloadTypeRichText {
+		t.Fatalf("image1 parent-tracking mismatch: virtual=%v parent=%d ptype=%d", img1.Virtual, img1.ParentMessageID, img1.ParentPayloadType)
 	}
-	// _id 复合键：image 是第 2 个 block（index=1）。
-	if got := img.idString(); got != "2062443880774537216-rt1" {
-		t.Fatalf("image _id want <parent>-rt1, got %q", got)
+	if img1.MessageID != d.MessageID {
+		t.Fatalf("derivative messageId must equal parent: got %d want %d", img1.MessageID, d.MessageID)
 	}
-	// subSeq = block序号 i+1（父独占 0）。image 在 index=1 → subSeq=2。
-	if img.SubSeq != 2 {
-		t.Fatalf("image subSeq want 2 (block idx 1 +1), got %d", img.SubSeq)
+	// _id 复合键：第一张图在 block index=1。
+	if got := img1.idString(); got != "2062443880774537216-rt1" {
+		t.Fatalf("image1 _id want <parent>-rt1, got %q", got)
+	}
+	// subSeq = block序号 i+1（父独占 0）。idx1 → subSeq=2。
+	if img1.SubSeq != 2 {
+		t.Fatalf("image1 subSeq want 2 (block idx 1 +1), got %d", img1.SubSeq)
 	}
 
-	file := d.Derivatives[1]
-	if file.Payload == nil || file.Payload.Type == nil || *file.Payload.Type != payloadTypeFile {
-		t.Fatalf("derivative[1] want file type=8, got %+v", file.Payload)
+	img2 := d.Derivatives[1]
+	if img2.Payload == nil || img2.Payload.Type == nil || *img2.Payload.Type != payloadTypeImage {
+		t.Fatalf("derivative[1] want image type=2, got %+v", img2.Payload)
 	}
-	if file.Payload.File == nil || file.Payload.File.URL != "http://x/b.pdf" ||
-		file.Payload.File.Name != "b.pdf" || file.Payload.File.Size != 1234 ||
-		file.Payload.File.Extension != "pdf" {
-		t.Fatalf("file projection mismatch: %+v", file.Payload.File)
+	if img2.Payload.Image == nil || img2.Payload.Image.URL != "http://x/c.png" {
+		t.Fatalf("image2 projection mismatch: %+v", img2.Payload.Image)
 	}
-	if got := file.idString(); got != "2062443880774537216-rt2" {
-		t.Fatalf("file _id want <parent>-rt2, got %q", got)
+	// 第二张图在 block index=3（file 在 idx2 不派生，但 _id/subSeq 仍用原始 block 下标）。
+	if got := img2.idString(); got != "2062443880774537216-rt3" {
+		t.Fatalf("image2 _id want <parent>-rt3 (original block idx), got %q", got)
 	}
-	// file 在 index=2 → subSeq=3。
-	if file.SubSeq != 3 {
-		t.Fatalf("file subSeq want 3 (block idx 2 +1), got %d", file.SubSeq)
+	if img2.SubSeq != 4 {
+		t.Fatalf("image2 subSeq want 4 (block idx 3 +1), got %d", img2.SubSeq)
 	}
 	// 父 doc subSeq 独占 0。
 	if d.SubSeq != 0 {
 		t.Fatalf("parent richtext doc subSeq want 0, got %d", d.SubSeq)
 	}
 	// 继承父可见性字段。
-	if file.ChannelID != d.ChannelID || file.From != d.From || file.Timestamp != d.Timestamp {
-		t.Fatalf("file did not inherit parent fields: %+v", file)
+	if img2.ChannelID != d.ChannelID || img2.From != d.From || img2.Timestamp != d.Timestamp {
+		t.Fatalf("image2 did not inherit parent fields: %+v", img2)
+	}
+	// 子文档不写 payloadRaw，不携带自己的 Derivatives。
+	if len(img2.PayloadRaw) != 0 || len(img2.Derivatives) != 0 {
+		t.Fatalf("child must clear payloadRaw/Derivatives, got rawLen=%d derivs=%d", len(img2.PayloadRaw), len(img2.Derivatives))
+	}
+}
+
+// TestRichTextDerivatives_EmptyURLImageSkipped 空 url 的 image block 被跳过（防御分支），
+// 且跳过不打乱后续 block 的编号：content=[text(idx0), image无url(idx1), image有url(idx2)]，
+// 只派生 1 个子文档（idx2），其 subSeq=3、_id 后缀 "-rt2"（仍按原始 block 下标 i=2 计）。
+func TestRichTextDerivatives_EmptyURLImageSkipped(t *testing.T) {
+	raw := richTextRaw(`[
+		{"type":"text","text":"前言"},
+		{"type":"image","url":"","name":"empty.png","width":10,"height":20},
+		{"type":"image","url":"http://x/c.png","name":"c.png","width":50,"height":60}
+	]`)
+	d, err := DocFromMessage(branchAMsg("2062443880774537216", raw))
+	if err != nil {
+		t.Fatalf("DocFromMessage: %v", err)
+	}
+	// 空 url image (idx1) 被跳过 → 只有 1 个 image 子文档（idx2）。
+	if len(d.Derivatives) != 1 {
+		t.Fatalf("want 1 derivative (empty-url image skipped), got %d", len(d.Derivatives))
+	}
+
+	img := d.Derivatives[0]
+	if img.Payload == nil || img.Payload.Type == nil || *img.Payload.Type != payloadTypeImage {
+		t.Fatalf("derivative[0] want image type=2, got %+v", img.Payload)
+	}
+	if img.Payload.Image == nil || img.Payload.Image.URL != "http://x/c.png" {
+		t.Fatalf("derivative projection mismatch: %+v", img.Payload.Image)
+	}
+	// _id/subSeq 仍按原始 block 下标 i=2 计（跳过不打乱后续编号）。
+	if got := img.idString(); got != "2062443880774537216-rt2" {
+		t.Fatalf("derivative _id want <parent>-rt2 (original block idx), got %q", got)
+	}
+	if img.SubSeq != 3 {
+		t.Fatalf("derivative subSeq want 3 (block idx 2 +1), got %d", img.SubSeq)
 	}
 }
 
@@ -139,7 +181,7 @@ func TestEncodeBulkBody_ParentChildAdjacent(t *testing.T) {
 // TestMapBulkResults_ParentChildOnlyParentReported 父+N子混在响应里，结果只返回父；
 // 子全 OK → 父 OK；任一子失败 → 父被判失败（父子原子）。
 func TestMapBulkResults_ParentChildOnlyParentReported(t *testing.T) {
-	raw := richTextRaw(`[{"type":"image","url":"http://x/a.png"},{"type":"file","url":"http://x/b.pdf"}]`)
+	raw := richTextRaw(`[{"type":"image","url":"http://x/a.png"},{"type":"image","url":"http://x/b.png"}]`)
 	parent, err := DocFromMessage(branchAMsg("700", raw))
 	if err != nil {
 		t.Fatalf("DocFromMessage: %v", err)

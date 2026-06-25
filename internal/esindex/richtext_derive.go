@@ -6,18 +6,22 @@ import (
 
 // 富文本(type=14)内嵌媒体虚拟子文档（B2 方案，richtext-virtual-docs-indexer-dev.md）。
 //
-// 目标：让富文本里内嵌的 image/file 能被 reader 的 _search_media / _search_files 搜到。
-// 对每个内嵌 image/file block，额外产出一个独立 OS doc，长得就像普通图片(type=2)/文件(type=8)
-// 消息，带 virtual=true + parentMessageId。reader 媒体/文件端点白名单（payload.type∈{2,5,8}）
-// 直接命中，octo-server 几乎不用改。
+// 目标：让富文本里内嵌的 image 能被 reader 的 _search_media 搜到。
+// 对每个内嵌 image block，额外产出一个独立 OS doc，长得就像普通图片(type=2)消息，
+// 带 virtual=true + parentMessageId。reader 媒体端点白名单（payload.type∈{2,5,8}）直接命中，
+// octo-server 几乎不用改。本期富文本只能内嵌 image，故只会产 type=2。
 //
-// 范围（本期保守）：
-//   - 只派生 image(→type=2) / file(→type=8)。richText block 类型仅 text/image/file（对齐
-//     octo-web RichTextBlockType / octo-lib common/richtext.go），不臆造 video block。
+// 范围（本期，与上游契约收敛）：
+//   - 只派生 image(→type=2)。富文本(type=14) block 类型**仅 text/image**（octo-lib
+//     common/richtext.go 锁定：RichTextBlockType 只有 text/image，ValidateRichTextBlocks 对其他
+//     type 返 ErrRichTextUnknownBlock 拒入库；octo-web 发送侧只有 makeImageBlock/makeTextBlock，
+//     buildRichTextMixedCandidate 遇 file 直接 return null）。**file block 全链路未打开**
+//     （前端仅前向兼容接收渲染，不发送；后端不收），故现实中不会产生 file 富文本消息。
+//     待 octo-lib/后端正式打开 file block 契约后，再扩展 file→type=8 派生。
 //   - 撤回/编辑联动**不做**（路线甲：reader 用 parentMessageId 回 MySQL join 判可见性/撤回）。
 //   - 子文档继承父的标识/时序/可见性字段；ES _id = "<父messageId>-rt<i>"（i 按 blocks 顺序，从 0 起）。
 
-// richTextDerivatives 从父 doc 的 RawPayload 解析 type=14 的 image/file block，产出虚拟子文档列表。
+// richTextDerivatives 从父 doc 的 RawPayload 解析 type=14 的 image block，产出虚拟子文档列表。
 //
 // 仅当父 doc 确为富文本（Payload.Type==14）且 RawPayload 非空时产出；否则返回 nil。
 // 子文档幂等键 _id 用复合键，重跑 backfill/consumer 重投覆盖同一条，不重复创建。
@@ -40,56 +44,49 @@ func richTextDerivatives(parent Doc) []Doc {
 	var out []Doc
 	for i, blk := range blocks {
 		t, _ := blk["type"].(string)
-		var sub *Payload
-		switch t {
-		case "image":
-			sub = &Payload{Type: intPtr(payloadTypeImage), Image: imageFromBlock(blk)}
-		case "file":
-			sub = &Payload{Type: intPtr(payloadTypeFile), File: fileFromBlock(blk)}
-		default:
-			continue // text / 未知 block：不派生媒体子文档
+		if t != "image" {
+			continue // text / 未知 block：不派生媒体子文档（file 契约未打开）
 		}
+		img := imageFromBlock(blk)
+		if img.URL == "" {
+			continue // 空 url image block（契约上 image url 必填）：不索空壳媒体子文档
+		}
+		sub := &Payload{Type: intPtr(payloadTypeImage), Image: img}
 		out = append(out, deriveChild(parent, sub, i))
 	}
 	return out
 }
 
-// deriveChild 构造一个虚拟子文档：继承父的标识/时序/可见性字段，挂上自身媒体 payload。
+// deriveChild 构造一个虚拟子文档：**复制父再覆盖**（而非逐字段枚举），保证父的标识/
+// 时序/可见性字段（含以后新增的）都被继承，不会漏。然后显式覆盖/清零非继承项。
 // ES _id = "<父messageId>-rt<i>"（字符串复合键，messageId 字段仍保留父值供 reader 游标排序）。
 func deriveChild(parent Doc, sub *Payload, i int) Doc {
-	return Doc{
-		SchemaVersion: parent.SchemaVersion,
-		MessageID:     parent.MessageID, // 与父相同（reader cursor 排序键 timestamp+messageId 不被打散）
-		MessageSeq:    parent.MessageSeq,
-		From:          parent.From,
-		To:            parent.To,
-		ChannelID:     parent.ChannelID,
-		ChannelType:   parent.ChannelType,
-		SpaceID:       parent.SpaceID,
-		Visibles:      parent.Visibles,
-		Timestamp:     parent.Timestamp,
-		CreatedAt:     parent.CreatedAt,
-		Source:        parent.Source,
-		Payload:       sub,
-		// 父子追踪
-		ParentMessageID:   parent.MessageID,
-		ParentPayloadType: payloadTypeRichText,
-		Virtual:           true,
-		// SubSeq 父独占 0，子从 1 递增（block 序号 i+1），保 (messageId, subSeq) 不跟父及兄弟撞。
-		SubSeq: i + 1,
-		// _id 复合键（字符串），不影响 messageId 字段保持 long
-		idOverride: fmt.Sprintf("%d-rt%d", parent.MessageID, i),
-	}
+	child := parent // 继承父全部字段（含 SchemaVersion/MessageID/MessageSeq/From/To/Channel*/SpaceID/Visibles/Timestamp/CreatedAt/Source 及未来新增可见性字段）
+
+	// 显式清零非继承项（关键）：
+	child.PayloadRaw = nil   // 子文档不写 payloadRaw（契约）
+	child.Derivatives = nil  // 切断对父 Derivatives 切片的别名引用；当前 encodeBulkBody 只展开一层，此为防御性清零
+	child.RawExcluded = false
+
+	// 虚拟子文档自身字段：
+	child.Payload = sub
+	child.ParentMessageID = parent.MessageID
+	child.ParentPayloadType = payloadTypeRichText
+	child.Virtual = true
+	// SubSeq 父独占 0，子从 1 递增（block 序号 i+1），保 (messageId, subSeq) 不跟父及兄弟撞。
+	child.SubSeq = i + 1
+	// _id 复合键（字符串），不影响 messageId 字段保持 long
+	child.idOverride = fmt.Sprintf("%d-rt%d", parent.MessageID, i)
+	return child
 }
 
 // imageFromBlock 把 richText image block 投影成 ImagePayload（与普通图片消息一致）。
+// 字段严格对齐 octo-lib RichTextBlock 与 reader ImagePayload 形态：url/name/width/height。
+// （富文本 image block 无 caption；reader ImagePayload 无 size 字段，故不投 size。）
 func imageFromBlock(blk map[string]any) *ImagePayload {
 	p := &ImagePayload{}
 	if u, ok := blk["url"].(string); ok {
 		p.URL = u
-	}
-	if c, ok := blk["caption"].(string); ok {
-		p.Caption = c
 	}
 	if n, ok := blk["name"].(string); ok {
 		p.Name = n
@@ -99,27 +96,6 @@ func imageFromBlock(blk map[string]any) *ImagePayload {
 	}
 	if h, ok := extractInt(blk, "height"); ok {
 		p.Height = h
-	}
-	return p
-}
-
-// fileFromBlock 把 richText file block 投影成 FilePayload（与普通文件消息一致）。
-func fileFromBlock(blk map[string]any) *FilePayload {
-	p := &FilePayload{}
-	if u, ok := blk["url"].(string); ok {
-		p.URL = u
-	}
-	if n, ok := blk["name"].(string); ok {
-		p.Name = n
-	}
-	if c, ok := blk["caption"].(string); ok {
-		p.Caption = c
-	}
-	if sz, ok := extractInt64(blk, "size"); ok {
-		p.Size = sz
-	}
-	if ext, ok := blk["extension"].(string); ok {
-		p.Extension = ext
 	}
 	return p
 }
