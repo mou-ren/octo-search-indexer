@@ -136,7 +136,11 @@ func TestDLQHardStopVsExhausted_MetricSemantics(t *testing.T) {
 		dlq.sleep = func(context.Context, time.Duration) error { return nil }
 		p := NewProcessor(src, w, dlq, al, Config{BatchSize: 10, TransientBackoff: time.Millisecond}, m)
 		p.sleep = func(context.Context, time.Duration) error { return nil }
-		_ = p.processBatch(context.Background(), []fetchedMessage{fm(0, validMsg("a"))})
+		// 无 spill 路径会真实硬停返回 error，配 spill 路径越过返回 nil；
+		// 本用例只断言指标语义，error 与否由各调用方按 spillDir 自行预期，这里统一吞掉。
+		if err := p.processBatch(context.Background(), []fetchedMessage{fm(0, validMsg("a"))}); err != nil {
+			t.Logf("processBatch returned (expected for no-spill hard stop): %v", err)
+		}
 		return dumpMetrics(t, m)
 	}
 
