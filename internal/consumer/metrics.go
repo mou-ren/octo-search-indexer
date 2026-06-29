@@ -13,6 +13,10 @@ const metricsNamespace = "indexer"
 // producer leg.
 var latencyBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}
 
+// msgLatencyBuckets bucketizes end-to-end message latency (sub-second up to
+// 30min), too coarse for the IO-op buckets above.
+var msgLatencyBuckets = []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800}
+
 // Metrics is the es-indexer consumer observability set, backed by the prometheus
 // client_golang SDK on a private registry (no global default registry — the two
 // binaries must never cross-register each other's series).
@@ -36,6 +40,7 @@ type Metrics struct {
 	committed    *prometheus.GaugeVec
 	ioOpDuration *prometheus.HistogramVec
 	ioOpErrors   *prometheus.CounterVec
+	msgLatency   *prometheus.HistogramVec
 }
 
 // NewMetrics constructs a Metrics bound to its own registry.
@@ -84,10 +89,16 @@ func NewMetrics() *Metrics {
 			Name:      "io_op_errors_total",
 			Help:      "IO operation failures by op.",
 		}, []string{"op"}),
+		msgLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "message_latency_seconds",
+			Help:      "Message latency to ES visibility by stage (e2e: from DB created_at; send_to_index: from msg send timestamp).",
+			Buckets:   msgLatencyBuckets,
+		}, []string{"stage"}),
 	}
 	reg.MustRegister(
 		m.disposition, m.dlq, m.dlqHardStop, m.dlqExhausted, m.bulkErrors,
-		m.committed, m.ioOpDuration, m.ioOpErrors,
+		m.committed, m.ioOpDuration, m.ioOpErrors, m.msgLatency,
 	)
 	return m
 }
@@ -129,4 +140,13 @@ func (m *Metrics) ObserveIO(op string, d time.Duration) {
 // MarkIOError records one IO failure by op.
 func (m *Metrics) MarkIOError(op string) {
 	m.ioOpErrors.WithLabelValues(op).Inc()
+}
+
+// ObserveMessageLatency records one message latency sample for stage (e2e or
+// send_to_index). Negative durations (clock skew where now < ts) clamp to 0.
+func (m *Metrics) ObserveMessageLatency(stage string, d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	m.msgLatency.WithLabelValues(stage).Observe(d.Seconds())
 }
