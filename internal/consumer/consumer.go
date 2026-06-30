@@ -259,6 +259,15 @@ func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, par
 		case ok:
 			dispositions[idx] = dispOK
 			p.markDisposition(dispOK)
+			if p.metrics != nil {
+				now := time.Now()
+				if parsed[idx].CreatedAt > 0 {
+					p.metrics.ObserveMessageLatency("e2e", now.Sub(time.Unix(parsed[idx].CreatedAt, 0)))
+				}
+				if parsed[idx].MsgTimestamp > 0 {
+					p.metrics.ObserveMessageLatency("send_to_index", now.Sub(time.Unix(parsed[idx].MsgTimestamp, 0)))
+				}
+			}
 			changed = true
 		case permanent:
 			if err := p.routePoison(ctx, batch[idx], res, reasonPermanent4xx); err != nil {
