@@ -186,7 +186,7 @@ func TestMetrics_TombstoneOnPermanentFail(t *testing.T) {
 	e := &Extractor{os: osw, maxFileSize: 1024, extractorLabel: "tika/test", metrics: m}
 
 	fp := &filePayload{URL: "http://x/y.pdf", Name: "y.pdf", Extension: ".pdf", Size: 2048}
-	reason, _, err := e.ExtractAndWrite(context.Background(), "42", fp)
+	reason, _, err := e.ExtractAndWrite(context.Background(), "42", fp) //nolint:errcheck // cause 供 DLQ 记录用，测试只断言 reason/err
 	if reason != ReasonOversize || err != nil {
 		t.Fatalf("expected oversize DLQ, got reason=%q err=%v", reason, err)
 	}
@@ -257,7 +257,7 @@ func TestMetrics_IOError_OSUpdate(t *testing.T) {
 	// 真错误：OS 400 → errOSPermanent（非 errDocNotYet）→ io_op_errors_total{os_update} 加 1
 	e, m, cdnURL := newTestExtractor(t, http.StatusBadRequest, "extracted content 抽出内容", 1024*1024)
 	fp := &filePayload{URL: cdnURL + "/x.pdf", Name: "x.pdf", Extension: ".pdf", Size: 100}
-	if _, _, err := e.ExtractAndWrite(context.Background(), "42", fp); err == nil {
+	if _, _, err := e.ExtractAndWrite(context.Background(), "42", fp); err == nil { //nolint:errcheck // cause 供 DLQ 记录用，测试只断言 err
 		t.Fatal("expected OS permanent error, got nil")
 	}
 	if got := counterVal(t, m, "fileextract_io_op_errors_total", map[string]string{"op": "os_update"}); got != 1 {
@@ -267,7 +267,7 @@ func TestMetrics_IOError_OSUpdate(t *testing.T) {
 	// errDocNotYet：OS 404 时序竞态 → io_op_errors_total{os_update}【不】加 1（第 1 条修复）
 	e2, m2, cdnURL2 := newTestExtractor(t, http.StatusNotFound, "extracted content 抽出内容", 1024*1024)
 	fp2 := &filePayload{URL: cdnURL2 + "/x.pdf", Name: "x.pdf", Extension: ".pdf", Size: 100}
-	if _, _, err := e2.ExtractAndWrite(context.Background(), "42", fp2); err == nil {
+	if _, _, err := e2.ExtractAndWrite(context.Background(), "42", fp2); err == nil { //nolint:errcheck // cause 供 DLQ 记录用，测试只断言 err
 		t.Fatal("expected errDocNotYet, got nil")
 	}
 	if got := counterVal(t, m2, "fileextract_io_op_errors_total", map[string]string{"op": "os_update"}); got != -1 && got != 0 {
