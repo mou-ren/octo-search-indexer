@@ -67,16 +67,18 @@ func NewProcessor(src messageSource, dlq dlqSink, ext extractorService, cfg Serv
 	// v1.13 P2-1：dlqHandler 有界重试 + spill 逃逸（yujiawei review fix）。缺 SpillDir 时
 	// DLQ 写耗尽 → errDLQHardStop → outcomeFatal → Run 停 worker + K8s 重启（保 offset 不推进）。
 	// 配 SpillDir 后转成落盘 + 告警 + offset 越过（绝不永久卡 partition）。
+	metrics := newCounters()
 	handler := newDLQHandler(dlq, newLogAlerter(log.Printf), dlqHandlerConfig{
 		MaxRetries:   cfg.DLQMaxRetries,
 		RetryBackoff: cfg.DLQRetryBackoff,
 		SpillDir:     cfg.DLQSpillDir,
 	})
+	handler.metrics = metrics // P1：DLQ 写失败逃逸埋点注入
 	return &Processor{
 		source:    src,
 		dlqSink:   dlq,
 		dlq:       handler,
-		metrics:   newCounters(),
+		metrics:   metrics,
 		extractor: ext,
 		cfg:       cfg,
 		sleep:     sleepCtx,
