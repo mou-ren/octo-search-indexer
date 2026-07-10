@@ -43,6 +43,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		return nil, fmt.Errorf("fileextract: build extractor: %w", err)
 	}
 	proc := NewProcessor(source, dlqSink, extractor, cfg)
+	// P1 埋点注入：extractor 的 io_op / tombstone / truncated / content_bytes 埋点写进
+	// processor 的私有 registry（同一 counters）。不改 metrics 所有权/透传链，只加字段注入。
+	extractor.metrics = proc.Metrics()
 	return &Service{
 		proc:      proc,
 		source:    source,
@@ -53,6 +56,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 
 // Run 运行到 ctx 取消。
 func (s *Service) Run(ctx context.Context) error { return s.proc.Run(ctx) }
+
+// Metrics 暴露底层计数集的私有 registry，供 obs server 走 /metrics。
+func (s *Service) Metrics() *counters { return s.proc.Metrics() }
 
 // Close 关闭底层 Kafka client（Reader + DLQ Writer）。
 func (s *Service) Close() error {

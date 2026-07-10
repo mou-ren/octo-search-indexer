@@ -25,6 +25,10 @@ type Extractor struct {
 	os             *osWriter
 	maxFileSize    int64
 	extractorLabel string // 写进 contentMeta.extractor (e.g. "tika/3.3.0")
+	// metrics 为 P1 埋点注入的计数集，可为 nil（老 test 手工装配 Extractor 不传）；
+	// 所有 counters 方法 nil-receiver 安全，nil 时跳过埋点。由 service.go 装配时传入
+	// processor 的 metrics（不改 metrics 所有权/透传链，只加字段注入）。
+	metrics *counters
 }
 
 // NewExtractor 构造。所有下游 client 均在这里装配，consumer.Service / backfill Runner 各自 New 一份。
@@ -119,7 +123,9 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 			//  backfill 再次拉到同 doc 时会重新触发 tombstone 写入）。
 			log.Printf("file-extractor: WriteTombstone messageID=%s reason=%s failed (backfill will retry): %v",
 				messageID, dlqReason, terr)
+			return
 		}
+		e.metrics.IncTombstone(dlqReason)
 	}()
 
 	// 1. 扩展名白名单前置校验（黑名单 → skip 不 DLQ，白名单外 → DLQ blacklist_ext）
@@ -132,8 +138,11 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 		return ReasonOversize, errors.New("file size exceeds cutoff"), nil
 	}
 	// 3. 下载
+	dlStart := time.Now()
 	body, _, derr := e.download.Fetch(ctx, fp.URL)
+	e.metrics.ObserveIO("download", time.Since(dlStart))
 	if derr != nil {
+		e.metrics.IncIOError("download")
 		if errors.Is(derr, errOversize) {
 			return ReasonOversize, derr, nil
 		}
@@ -155,7 +164,9 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 	start := time.Now()
 	content, truncated, terr := e.tika.Extract(ctx, body, fp.Name, ext)
 	extractMs := time.Since(start).Milliseconds()
+	e.metrics.ObserveIO("tika_extract", time.Since(start))
 	if terr != nil {
+		e.metrics.IncIOError("tika_extract")
 		switch {
 		case errors.Is(terr, errEncrypted):
 			return ReasonEncrypted, terr, nil
@@ -170,6 +181,11 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 		// scanned/empty PDF 常返 "\n\n" / 空格串，会漏过 → 无意义 doc 被误 commit）
 		return ReasonEmptyExtract, errors.New("tika returned empty or whitespace-only content"), nil
 	}
+	// 抽取成功：记正文字节数 + 截断计数。
+	e.metrics.ObserveContentBytes(len(content))
+	if truncated {
+		e.metrics.IncTruncated()
+	}
 	// 5. OS partial update
 	meta := esindex.FileContentMeta{
 		ExtractedAt: time.Now().Unix(),
@@ -177,7 +193,15 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 		Truncated:   &truncated, // v1.13 P2-5：指针便于清除 stale true
 		ExtractMs:   &extractMs, // Round-4 TKT-5：同 P2-5 pattern，显式落盘允许 0ms 覆盖 stale
 	}
-	if uerr := e.os.UpdateContent(ctx, messageID, content, meta); uerr != nil {
+	osStart := time.Now()
+	uerr := e.os.UpdateContent(ctx, messageID, content, meta)
+	e.metrics.ObserveIO("os_update", time.Since(osStart))
+	if uerr != nil {
+		// errDocNotYet 是主 doc 未落的正常时序竞态（上层 consumer 已用 IncDocNotYet() 单独计数），
+		// 不该再计入 os_update IO 错误，否则会污染错误率。只上抛让 caller 重试整批。
+		if !errors.Is(uerr, errDocNotYet) {
+			e.metrics.IncIOError("os_update")
+		}
 		// 主 doc 未落 → 上抛让 caller 重试整批（consumer 走 kafka rebalance 重取）
 		return "", nil, uerr
 	}

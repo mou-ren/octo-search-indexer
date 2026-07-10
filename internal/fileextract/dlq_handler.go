@@ -55,6 +55,9 @@ type dlqHandler struct {
 	cfg     dlqHandlerConfig
 	sleep   func(context.Context, time.Duration) error // ctx-aware，测试注入即时返
 	nowUnix func() int64
+	// metrics 为 P1 埋点注入的计数集，可为 nil（老 test 直接 newDLQHandler 不设）；
+	// nil-receiver 安全，nil 时跳过埋点。由 NewProcessor 装配时设为 processor 的 metrics。
+	metrics *counters
 }
 
 // newDLQHandler 组装 handler。sleep 走本包 backoff.go 的 sleepCtx，nowUnix 走 time.Now。
@@ -110,6 +113,8 @@ func (h *dlqHandler) Send(ctx context.Context, rec dlqRecord) error {
 // escape 执行终态逃逸：SpillDir 非空 → 落盘 + 告警 + 返 nil 允许越过；否则返 errDLQHardStop。
 // 落盘文件名 `dlq-spill-<partition>-<offset>-<epoch>.json`（partition+offset 保证唯一，epoch 便于排序）。
 func (h *dlqHandler) escape(rec dlqRecord, detail string) error {
+	// P1：DLQ 写重试耗尽逃逸（spill 或 hard stop）计一次。P0 告警依赖项。
+	h.metrics.IncDLQWriteError()
 	if h.cfg.SpillDir == "" {
 		return errDLQHardStop
 	}
